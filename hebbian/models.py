@@ -21,8 +21,8 @@ class HebbianModel(ABC):
 
     Conventions:
         - x: shape (samples, n); Input samples
-        - weights: shape (k, n); Weight matrix where k is output_size
-        - y = weights @ x.T: shape (k,); Output after forward pass
+        - weights: shape (m, n); Weight matrix where m is output_size
+        - y = weights @ x.T: shape (m,); Output after forward pass
     """
     def __init__(self, input_size: int, output_size: int, learning_rate: float = 0.01, rng: Optional[Any] = None) -> None:
         if input_size <= 0 or output_size <= 0:
@@ -43,7 +43,7 @@ class HebbianModel(ABC):
             x: Input sample of shape (n,) or (1, n)
 
         Returns:
-            np.ndarray: Output vector of shape (k,)
+            np.ndarray: Output vector of shape (m,)
 
         Raises:
             ValueError: If input dimensions don't match the model's input size
@@ -51,7 +51,7 @@ class HebbianModel(ABC):
         x = np.asarray(x, dtype=float).reshape(-1)
         if x.shape[0] != self.input_size:
             raise ValueError(f"Input shape {x.shape} does not match model input size ({self.input_size},)")
-        return self.weights @ x.T  # (k,)
+        return self.weights @ x.T  # (m,)
 
     @abstractmethod
     def step(self, x: np.ndarray) -> np.ndarray:
