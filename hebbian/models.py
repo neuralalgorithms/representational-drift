@@ -24,15 +24,13 @@ class HebbianModel(ABC):
         - weights: shape (m, n); Weight matrix where m is output_size
         - y = weights @ x.T: shape (m,); Output after forward pass
     """
-    def __init__(self, input_size: int, output_size: int, learning_rate: float = 0.01, rng: Optional[Any] = None) -> None:
-        if input_size <= 0 or output_size <= 0:
-            raise ValueError(f"input_size ({input_size}) and output_size ({output_size}) must be positive integers.")
-        self.input_size = int(input_size)
+    def __init__(self, output_size: int, learning_rate: float = 0.01, rng: Optional[Any] = None) -> None:
         self.output_size = int(output_size)
         self.learning_rate = float(learning_rate)
         self.rng = np.random.default_rng(rng)
         # Initialize weights with small random values
-        self.weights = 0.01 * self.rng.standard_normal((self.output_size, self.input_size))
+        self.input_size = None  # to be set on first forward call
+        self.weights = None  # to be initialized on first forward call
 
 
     def forward(self, x: np.ndarray) -> np.ndarray:
@@ -41,16 +39,18 @@ class HebbianModel(ABC):
 
         Args:
             x: Input sample of shape (n,) or (1, n)
-
         Returns:
             np.ndarray: Output vector of shape (m,)
-
         Raises:
             ValueError: If input dimensions don't match the model's input size
         """
         x = np.asarray(x, dtype=float).reshape(-1)
-        if x.shape[0] != self.input_size:
-            raise ValueError(f"Input shape {x.shape} does not match model input size ({self.input_size},)")
+        if self.input_size is None:
+            self.input_size = x.shape[0]
+            # Initialize weights if not already done
+            self.weights = 0.01 * self.rng.standard_normal((self.output_size, self.input_size))
+        elif x.shape[0] != self.input_size:
+            raise ValueError(f"Input dimension {x.shape[0]} does not match model input size {self.input_size}")
         return self.weights @ x.T  # (m,)
 
     @abstractmethod
@@ -79,8 +79,8 @@ class HebbianModel(ABC):
         X: array-like of shape (sample, n)
         """
         X = np.asarray(X, dtype=float)
-        if X.ndim != 2 or X.shape[1] != self.input_size:
-            raise ValueError(f"X has shape {X.shape}, expected (N, {self.input_size})")
+        if X.ndim != 2:
+            raise ValueError(f"Input X must be 2D, got shape {X.shape}")
         N = X.shape[0]
         for _ in range(int(epochs)):
             idx = np.arange(N)
@@ -109,7 +109,6 @@ class HebbianModel(ABC):
         """
         return {
             "model_type": self.__class__.__name__,
-            "input_size": self.input_size,
             "output_size": self.output_size,
             "learning_rate": self.learning_rate,
             "parameter_count": self.weights.size,

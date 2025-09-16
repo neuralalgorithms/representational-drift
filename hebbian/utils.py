@@ -73,7 +73,7 @@ def testing_alignment(model, X, epochs, pcs, shuffle=False, method="epochs"):
     N = len(X)
     align_hist = []
 
-    def align_from_W(W):
+    def alignment(W):
         # single-output
         if W.ndim == 1 or (W.ndim == 2 and W.shape[0] == 1):
             w = W if W.ndim == 1 else W[0, :]
@@ -85,30 +85,27 @@ def testing_alignment(model, X, epochs, pcs, shuffle=False, method="epochs"):
     for _ in range(int(epochs)):
         if method == "epochs":
             model.train(X, epochs=1, shuffle=shuffle)  # one epoch
-            align_hist.append(align_from_W(model.weights))
+            align_hist.append(alignment(model.weights))
         elif method == "trials":
             idx = np.arange(N)
             if shuffle:
                 model.rng.shuffle(idx)
             for i in idx:
                 model.step(X[i])
-                align_hist.append(align_from_W(model.weights))
+                align_hist.append(alignment(model.weights))
         else:
             raise ValueError("method must be 'epochs' or 'trials'.")
     return align_hist
-
 
 # the main function to train and test the models
 def training_testing(
     samples,
     models=None,                 # list/dict of model classes or instances
     output_size=None,
-    learning_rate=0.1,
     epochs=1,
     method="epochs",
     pc_method="ordered",
-    show_num=None,
-    gamma=0.01
+    show_num=None
 ):
     """
     Run training/testing over one or more models and visualize alignment per model.
@@ -185,12 +182,8 @@ def training_testing(
 
     # Iterate over models
     for label, m in items:
-        # Instantiate if callable; otherwise use the given instance
-        if callable(m):
-            model_obj = m(input_size=samples_dim, output_size=output_size, learning_rate=learning_rate, gamma=gamma)
-        else:
-            model_obj = m
-
+        model_obj = m
+        
         hist = testing_alignment(model_obj, samples, epochs=epochs, pcs=pcs_for_eval, method=method)
         histories_by_model[label] = np.array(hist)
         weights_by_model[label] = model_obj.weights.copy()
@@ -208,7 +201,6 @@ def training_testing(
             input_size=samples_dim,
             xlabel=method,
         )
-    return histories_by_model, weights_by_model
 
 # to test the eigenvalue
 def estimate_output_variances(X, weights, center=True, unit_weights=True):
