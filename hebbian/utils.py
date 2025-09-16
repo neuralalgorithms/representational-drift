@@ -85,65 +85,130 @@ def testing_alignment(model, X, epochs, pcs, shuffle=False, method="epochs"):
     for _ in range(int(epochs)):
         if method == "epochs":
             model.train(X, epochs=1, shuffle=shuffle)  # one epoch
-            align_hist.append(align_from_W(model.W))
+            align_hist.append(align_from_W(model.weights))
         elif method == "trials":
             idx = np.arange(N)
             if shuffle:
                 model.rng.shuffle(idx)
             for i in idx:
                 model.step(X[i])
-                align_hist.append(align_from_W(model.W))
+                align_hist.append(align_from_W(model.weights))
         else:
             raise ValueError("method must be 'epochs' or 'trials'.")
     return align_hist
 
 
 # the main function to train and test the models
-def training_testing(samples, model1, model2, output_size=None, learning_rate=0.1, epochs=1, method = "epochs", pc_method = "ordered", show_num = None):
-    global weights_model1_K, weights_model2_K
+def training_testing(
+    samples,
+    models=None,                 # list/dict of model classes or instances
+    output_size=None,
+    learning_rate=0.1,
+    epochs=1,
+    method="epochs",
+    pc_method="ordered",
+    show_num=None,
+    gamma=0.01
+):
+    """
+    Run training/testing over one or more models and visualize alignment per model.
+
+    Parameters
+    ----------
+    samples : np.ndarray
+        Data matrix of shape (n_samples, n_features).
+    models : list | dict
+        - If list: [ModelClassA, ModelClassB] or [("Label A", ModelClassA), instanceB, ...]
+        - If dict: {"Label A": ModelClassA, "Label B": instanceB}
+        Each element can be:
+          * a callable/class (will be instantiated with input_size, output_size, learning_rate), or
+          * a pre-instantiated model object that exposes `.weights` and works with `testing_alignment`.
+    output_size : int | None
+        Number of output units per model. Defaults to samples_dim if None.
+    learning_rate : float
+    epochs : int
+    method : {"epochs", ...}
+        Passed through to `testing_alignment`.
+    pc_method : {"first", "ordered"}
+        How to build the PC target set.
+    show_num : int | None
+        How many neurons to visualize per model (defaults to `output_size`).
+
+    Returns
+    -------
+    histories_by_model : dict[str, np.ndarray]
+        {label: history_array_of_shape_(T, output_size)}
+    weights_by_model : dict[str, np.ndarray]
+        {label: final_weights_matrix}
+    """
+
+    if models is None:
+        raise ValueError("Please provide `models` as a list or dict of models.")
+
     samples_dim = samples.shape[1]
-    # get the PCs 
+    output_size = output_size or samples_dim
+
+    # PCs
     pcs, _ = pca_topk(samples, samples_dim, center=True)
-
     if pc_method == "first":
-        pc_set = [pcs[:,0] for i in range(samples_dim)]
+        pc_set = [pcs[:, 0] for _ in range(samples_dim)]
     elif pc_method == "ordered":
-        pc_set = [pcs[:,i] for i in range(samples_dim)]
+        pc_set = [pcs[:, i] for i in range(samples_dim)]
     else:
-        raise ValueError("Has to be 'first' or 'ordered'")
+        raise ValueError("pc_method must be 'first' or 'ordered'.")
 
-    # oja1 = OjaNetwork(input_size=samples_dim, output_size=1, learning_rate=learning_rate)
-    model1_K = model1(input_size=samples_dim, output_size=output_size, learning_rate=learning_rate)
-    model2_K = model2(input_size=samples_dim, output_size=output_size, learning_rate=learning_rate)
+    # Normalize `models` into (label, obj_or_class) list
+    def _label_for(m):
+        if isinstance(m, tuple) and len(m) == 2:
+            return str(m[0])
+        if callable(m):
+            return getattr(m, "__name__", "Model")
+        return m.__class__.__name__
 
-    # hist_oja1 = testing_alignment(oja1, samples, epochs=epochs, pcs = [pc_set[0]], method=method)
-
-    if output_size > samples_dim:
-        hist_model1_K = testing_alignment(model1_K, samples, epochs=epochs, pcs = pc_set[:samples_dim], method=method)
-        hist_model2_K = testing_alignment(model2_K, samples, epochs=epochs, pcs = pc_set[:samples_dim], method=method)
+    if isinstance(models, dict):
+        items = list(models.items())  # (label, model)
+    elif isinstance(models, (list, tuple)):
+        items = []
+        for m in models:
+            if isinstance(m, tuple) and len(m) == 2:
+                items.append((str(m[0]), m[1]))
+            else:
+                items.append((_label_for(m), m))
     else:
-        hist_model1_K = testing_alignment(model1_K, samples, epochs=epochs, pcs = pc_set, method=method)
-        hist_model2_K = testing_alignment(model2_K, samples, epochs=epochs, pcs = pc_set, method=method)
+        raise ValueError("`models` must be a list/tuple or dict.")
 
-    # weights_oja1 = oja1.weights.copy()
-    weights_model1_K = model1_K.weights.copy()
-    weights_model2_K = model2_K.weights.copy()
+    histories_by_model = {}
+    weights_by_model = {}
 
-    ### visualize the alignment
-    display_dict_oja ={}
-    display_dict_sanger ={}
-    # display_dict_oja1 = {}
-    # display_dict_oja1["Oja-1"] = np.array(hist_oja1)
+    # Decide which PCs to pass based on output_size vs samples_dim
+    pcs_for_eval = pc_set[:samples_dim] if output_size > samples_dim else pc_set
 
-    if show_num == None:
-        show_num = output_size
-    for i in range(show_num):
-        display_dict_oja[f"Oja-multi (neuron {i+1})"] = np.array(hist_model1_K)[:,i]
-        display_dict_sanger[f"Sanger (neuron {i+1})"] = np.array(hist_model2_K)[:,i]
+    # Iterate over models
+    for label, m in items:
+        # Instantiate if callable; otherwise use the given instance
+        if callable(m):
+            model_obj = m(input_size=samples_dim, output_size=output_size, learning_rate=learning_rate, gamma=gamma)
+        else:
+            model_obj = m
 
-    visualize_alignment(list(display_dict_oja.values()), list(display_dict_oja.keys()), input_size=samples_dim, xlabel=method)
-    visualize_alignment(list(display_dict_sanger.values()), list(display_dict_sanger.keys()), input_size=samples_dim, xlabel=method)
+        hist = testing_alignment(model_obj, samples, epochs=epochs, pcs=pcs_for_eval, method=method)
+        histories_by_model[label] = np.array(hist)
+        weights_by_model[label] = model_obj.weights.copy()
 
+        # Visualization: one figure per model, lines = neurons
+        # (Matches your previous pattern of 1 plot per model.)
+        sn = show_num if show_num is not None else output_size
+        sn = min(sn, histories_by_model[label].shape[1])
+        display_dict = {
+            f"{label} (neuron {i+1})": histories_by_model[label][:, i] for i in range(sn)
+        }
+        visualize_alignment(
+            list(display_dict.values()),
+            list(display_dict.keys()),
+            input_size=samples_dim,
+            xlabel=method,
+        )
+    return histories_by_model, weights_by_model
 
 # to test the eigenvalue
 def estimate_output_variances(X, weights, center=True, unit_weights=True):
