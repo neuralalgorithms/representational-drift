@@ -6,6 +6,7 @@ Functions used to assist training and testing Hebbian models.
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+from scipy.stats import pearsonr
 
 #--------------------------------
 # Statistical functions
@@ -46,8 +47,10 @@ def pca_topk(X, k, center=True):
     # Eigenvalues of covariance = S^2 / (n-1)
     eigvals_full = (S**2) / (n - 1 if n > 1 else 1)
     eigvals = eigvals_full[:k]
+    # scores
+    scores = Xc @ pcs
 
-    return pcs, eigvals
+    return pcs, eigvals, scores
 
 def random_vector_chance_prob(input_size):
     return np.sqrt(2/(np.pi * input_size))
@@ -63,47 +66,16 @@ def cosine_alignment(u, v):
     v = v / (np.linalg.norm(v) + 1e-12)
     return float(abs(u @ v))
 
-def testing_alignment(model, X, epochs, pcs, shuffle=False, method="epochs"):
-    """
-    Record cosine alignment(s) while training, either:
-      - per epoch  (method='epochs'): one snapshot after each epoch
-      - per trials (method='trials'): snapshot after each step
-    """
-    X = np.asarray(X, float)
-    N = len(X)
-    align_hist = []
-
-    def alignment(W):
-        # single-output
-        if W.ndim == 1 or (W.ndim == 2 and W.shape[0] == 1):
-            w = W if W.ndim == 1 else W[0, :]
-            return cosine_alignment(w, pcs[0])
-        else:
-            m = min(W.shape[0], len(pcs))
-            return [cosine_alignment(W[i, :], pcs[i]) for i in range(m)]
-
-    for _ in range(int(epochs)):
-        if method == "epochs":
-            model.train(X, epochs=1, shuffle=shuffle)  # one epoch
-            align_hist.append(alignment(model.weights))
-        elif method == "trials":
-            idx = np.arange(N)
-            if shuffle:
-                model.rng.shuffle(idx)
-            for i in idx:
-                model.step(X[i])
-                align_hist.append(alignment(model.weights))
-        else:
-            raise ValueError("method must be 'epochs' or 'trials'.")
-    return align_hist
+def correlation_alignment(u, v):
+    r, _ = pearsonr(u, v)
+    return float(abs(r))
 
 # the main function to train and test the models
 def training_testing(
     samples,
     models=None,                 # list/dict of model classes or instances
     output_size=None,
-    epochs=1,
-    method="epochs",
+    alignment_method="weights",
     pc_method="ordered",
     show_num=None
 ):
@@ -145,14 +117,7 @@ def training_testing(
     samples_dim = samples.shape[1]
     output_size = output_size or samples_dim
 
-    # PCs
-    pcs, _ = pca_topk(samples, samples_dim, center=True)
-    if pc_method == "first":
-        pc_set = [pcs[:, 0] for _ in range(samples_dim)]
-    elif pc_method == "ordered":
-        pc_set = [pcs[:, i] for i in range(samples_dim)]
-    else:
-        raise ValueError("pc_method must be 'first' or 'ordered'.")
+
 
     # Normalize `models` into (label, obj_or_class) list
     def _label_for(m):
@@ -175,18 +140,44 @@ def training_testing(
         raise ValueError("`models` must be a list/tuple or dict.")
 
     histories_by_model = {}
-    weights_by_model = {}
 
+    # PCs
+    pcs, _, pc_scores = pca_topk(samples, samples_dim, center=True)
+    if pc_method == "first":
+        pc_set = [pcs[:, 0] for _ in range(samples_dim)]
+        pc_scores_set = [pc_scores[:, 0] for _ in range(samples_dim)]
+    elif pc_method == "ordered":
+        pc_set = [pcs[:, i] for i in range(samples_dim)]
+        pc_scores_set = [pc_scores[:, i] for i in range(samples_dim)]
+    else:
+        raise ValueError("pc_method must be 'first' or 'ordered'.")
     # Decide which PCs to pass based on output_size vs samples_dim
     pcs_for_eval = pc_set[:samples_dim] if output_size > samples_dim else pc_set
+    pcs_scores_for_eval = pc_scores_set[:samples_dim] if output_size > samples_dim else pc_scores_set
 
+    
     # Iterate over models
     for label, m in items:
         model_obj = m
-        
-        hist = testing_alignment(model_obj, samples, epochs=epochs, pcs=pcs_for_eval, method=method)
+        hist = []
+        y_hist = []
+        if alignment_method == "weights":
+            for i in range(samples.shape[0]):
+                model_obj.step(samples[i])
+                Amat = model_obj.get_effective_weights()
+                hist.append([cosine_alignment(Amat[i, :], pcs_for_eval[i]) for i in range(min(Amat.shape[0], len(pcs_for_eval)))])
+
+        elif alignment_method == "activity":
+            for i in range(samples.shape[0]):
+                yi = model_obj.step(samples[i])
+                y_hist.append(yi)
+                len_y_hist = len(y_hist)
+                if len_y_hist > 2:
+                    hist.append([correlation_alignment(np.array(y_hist)[:,i], np.array(pcs_scores_for_eval)[i,:len_y_hist]) for i in range(min(np.array(y_hist).shape[0], len(pcs_scores_for_eval)))])
+        else:
+            raise ValueError("alignment_method must be 'weights' or 'activity'.")
+
         histories_by_model[label] = np.array(hist)
-        weights_by_model[label] = model_obj.weights.copy()
 
         # Visualization: one figure per model, lines = neurons
         # (Matches your previous pattern of 1 plot per model.)
@@ -199,7 +190,7 @@ def training_testing(
             list(display_dict.values()),
             list(display_dict.keys()),
             input_size=samples_dim,
-            xlabel=method,
+            xlabel="trials",
         )
 
 # to test the eigenvalue

@@ -21,7 +21,7 @@ class HebbianModel(ABC):
 
     Conventions:
         - x: shape (samples, n); Input samples
-        - weights: shape (m, n); Weight matrix where m is output_size
+        - W: shape (m, n); Weight matrix where m is output_size
         - y = weights @ x.T: shape (m,); Output after forward pass
     """
     def __init__(self, output_size: int, learning_rate: float = 0.01, rng: Optional[Any] = None) -> None:
@@ -30,7 +30,6 @@ class HebbianModel(ABC):
         self.rng = np.random.default_rng(rng)
         # Initialize weights with small random values
         self.input_size = None  # to be set on first forward call
-        self.weights = None  # to be initialized on first forward call
 
 
     def forward(self, x: np.ndarray) -> np.ndarray:
@@ -48,10 +47,10 @@ class HebbianModel(ABC):
         if self.input_size is None:
             self.input_size = x.shape[0]
             # Initialize weights if not already done
-            self.weights = 0.01 * self.rng.standard_normal((self.output_size, self.input_size))
+            self.W = 0.01 * self.rng.standard_normal((self.output_size, self.input_size))
         elif x.shape[0] != self.input_size:
             raise ValueError(f"Input dimension {x.shape[0]} does not match model input size {self.input_size}")
-        return self.weights @ x.T  # (m,)
+        return self.W @ x.T  # (m,)
 
     @abstractmethod
     def step(self, x: np.ndarray) -> np.ndarray:
@@ -73,21 +72,17 @@ class HebbianModel(ABC):
         """
         raise NotImplementedError
 
-    def train(self, X, epochs=1, shuffle=True):
+    def train(self, X):
         """
-        Online training over X for 'epochs' passes.
+        A very simple trial by trial online training over X.
         X: array-like of shape (sample, n)
         """
         X = np.asarray(X, dtype=float)
         if X.ndim != 2:
             raise ValueError(f"Input X must be 2D, got shape {X.shape}")
         N = X.shape[0]
-        for _ in range(int(epochs)):
-            idx = np.arange(N)
-            if shuffle:
-                self.rng.shuffle(idx)
-            for t, i in enumerate(idx):
-                y = self.step(X[i]) 
+        for i in range(N):
+            y = self.step(X[i]) 
 
     def normalize_weights(self, axis: int = 1, epsilon: float = 1e-12) -> None:
             """
@@ -97,8 +92,11 @@ class HebbianModel(ABC):
                 axis (int): Axis along which to normalize (0=columns, 1=rows)
                 epsilon (float): Small constant for numerical stability
             """
-            norms = np.linalg.norm(self.weights, axis=axis, keepdims=True) + epsilon
-            self.weights /= norms
+            norms = np.linalg.norm(self.W, axis=axis, keepdims=True) + epsilon
+            self.W /= norms
+
+    def get_effective_weights(self):
+        return self.W
 
     def get_summary(self) -> dict:
         """
@@ -111,8 +109,8 @@ class HebbianModel(ABC):
             "model_type": self.__class__.__name__,
             "output_size": self.output_size,
             "learning_rate": self.learning_rate,
-            "parameter_count": self.weights.size,
-            "weight_shape": self.weights.shape
+            "parameter_count": self.W.size,
+            "weight_shape": self.W.shape
         }
 
 class OjaNetwork(HebbianModel):
@@ -135,8 +133,10 @@ class OjaNetwork(HebbianModel):
         x = np.asarray(x, dtype=float).reshape(-1)           # (n,)
         y = self.forward(x)                                  # (k,)
         # ΔW = eta * ( y x^T - y y^T w )                   # yx^T is (k, n); y y^T W is (k, n)
-        self.weights += self.learning_rate * (np.outer(y, x) - np.outer(y, y) @ self.weights)
+        self.W += self.learning_rate * (np.outer(y, x) - np.outer(y, y) @ self.W)
         return y
+    
+
     
 
 class SangerNetwork(HebbianModel):
@@ -167,5 +167,5 @@ class SangerNetwork(HebbianModel):
         y = self.forward(x)
         # ΔW = eta * (yx^T - BW), B is the lower triangular matrix of y y^T
         B = np.tril(np.outer(y, y))
-        self.weights += self.learning_rate * (np.outer(y,x) - B @ self.weights)
+        self.W += self.learning_rate * (np.outer(y,x) - B @ self.W)
         return y
