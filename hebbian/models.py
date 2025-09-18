@@ -24,9 +24,16 @@ class HebbianModel(ABC):
         - W: shape (m, n); Weight matrix where m is output_size
         - y = weights @ x.T: shape (m,); Output after forward pass
     """
-    def __init__(self, output_size: int, learning_rate: float = 0.01, rng: Optional[Any] = None) -> None:
+    def __init__(self, output_size: int, 
+                 learning_rate: float = 0.01, 
+                 learning_rate2: Optional[float] = None,
+                 rng: Optional[Any] = None) -> None:
         self.output_size = int(output_size)
         self.learning_rate = float(learning_rate)
+        if learning_rate2 is None:
+            self.learning_rate2 = float(learning_rate)
+        else:
+            self.learning_rate2 = float(learning_rate2)
         self.rng = np.random.default_rng(rng)
         # Initialize weights with small random values
         self.input_size = None  # to be set on first forward call
@@ -133,7 +140,7 @@ class OjaNetwork(HebbianModel):
         x = np.asarray(x, dtype=float).reshape(-1)           # (n,)
         y = self.forward(x)                                  # (k,)
         # ΔW = eta * ( y x^T - y y^T w )                   # yx^T is (k, n); y y^T W is (k, n)
-        self.W += self.learning_rate * (np.outer(y, x) - np.outer(y, y) @ self.W)
+        self.W += self.learning_rate * np.outer(y, x) - self.learning_rate2* np.outer(y, y) @ self.W
         return y
     
 
@@ -167,5 +174,5 @@ class SangerNetwork(HebbianModel):
         y = self.forward(x)
         # ΔW = eta * (yx^T - BW), B is the lower triangular matrix of y y^T
         B = np.tril(np.outer(y, y))
-        self.W += self.learning_rate * (np.outer(y,x) - B @ self.W)
+        self.W += self.learning_rate * np.outer(y,x) - self.learning_rate2 * B @ self.W
         return y
