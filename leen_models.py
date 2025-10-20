@@ -71,6 +71,32 @@ class LeenCompletePCA:
 
 
     # ---------- helpers ----------
+        # ---------- NEW: reset ----------
+    def reset(self, seed: int | None = None):
+        """
+        Reinitialize the model to a fresh state.
+
+        Parameters
+        ----------
+        seed : int | None
+            - If None  -> reuse self.seed (reproducible reset if self.seed was set).
+            - If given -> use this seed for the new RNG.
+        """
+        # RNG
+        if seed is None:
+            seed = self.seed
+        self.rng = np.random.default_rng(seed)
+
+        # Reinitialize W exactly as in __init__
+        W = self.rng.normal(size=(self.m, self.d))
+        W /= np.linalg.norm(W, axis=1, keepdims=True) + 1e-12
+        self.W = W
+        self.initial_W = W.copy()
+
+        # Reinitialize lateral q and EMA lam exactly as in __init__
+        self.q = np.zeros((self.m, self.m))
+        self.lam = np.full(self.m, 1e-6)
+
     # ---------- modified forward function to Y = Wx + Qy ----------
     def _forward(self, X: np.ndarray) -> np.ndarray:
         """
@@ -491,7 +517,7 @@ def Y_aligned_training_testing_online(model, X, batch_size=1, alignment = "corr"
         Y_output = model.transform(X)
         order, similarity, _, _ = best_match_align_timeseries(Y_output, PC_scores, metric=alignment)
         similarity_list.append(similarity)
-        if step % 10000 == 0:
+        if step % 1000 == 0:
             print(f"step {step:4d} | order = {order} | best|corr|= {np.round(similarity,3)}")
     similarity_list = np.array(similarity_list)
     if graph:
