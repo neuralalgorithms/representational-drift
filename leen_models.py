@@ -22,79 +22,62 @@ class LeenCompletePCA:
         Δw = η_w * ( <y x^T> - Diag(<y y^T>) w )
 
     Lateral Connection Update (Activity-Dependent, Eq. 47):
-        Δq_ik = η_q * ( (<y_i^2> + <y_k^2>) * q_ik - C * <y_i y_k> )
+        Δq_ik = η_v * ( (<y_i^2> + <y_k^2>) * v_ik - C * <y_i y_k> )
 
     Parameters
     ----------
     input_dim : int
     output_dim : int
     eta_w : float             # Forward learning rate
-    eta_q : float             # Lateral learning rate (make this larger than eta_w)
+    eta_v : float             # Lateral learning rate (make this larger than eta_w)
     C : float                 # Coupling; pick > 1 (e.g., 1.5)
     ema_alpha : float         # EMA step for activity λ_i ≈ E[y_i^2]
-    symmetrize_q : bool       # Keep q symmetric + zero diagonal after each step
+    symmetrize_V : bool       # Keep V symmetric + zero diagonal after each step
     seed : int or None
     """
     def __init__(self,
                  input_dim: int, output_dim: int,
                  eta_w: float = 1e-3,
-                 eta_q: float = 1e-2,
+                 eta_v: float = 1e-2,
                  C: float = 1.5,
                  ema_alpha: float = 0.05,
-                 symmetrize_q: bool = True,
+                 symmetrize_V: bool = True,
                  seed: int | None = 0, 
                  settling_steps: int = 10, 
                  noise_level: float = 0.01, 
-                 clip_q_spectral: float = 0.95):
+                 clip_V_spectral: float = 0.95):   # <-- NEW
         self.d = input_dim
         self.m = output_dim
         self.eta_w = eta_w
-        self.eta_q = eta_q
+        self.eta_v = eta_v
         self.C = C
         self.ema_alpha = ema_alpha
-        self.symmetrize_q = symmetrize_q
+        self.symmetrize_V = symmetrize_V
         self.settling_steps = settling_steps
         self.noise_level = noise_level
-        self.clip_q_spectral = clip_q_spectral
+        self.clip_V_spectral = clip_V_spectral
 
         self.rng = np.random.default_rng(seed)
-        # Row-wise unit-norm init for W
         W = self.rng.normal(size=(self.m, self.d))
         W /= np.linalg.norm(W, axis=1, keepdims=True) + 1e-12 
         self.W = W
         self.initial_W = W.copy()
-        # Symmetric zero-diagonal init for q
-        self.q = np.zeros((self.m, self.m))
+        # Symmetric zero-diagonal init for V
+        self.V = np.zeros((self.m, self.m))
         # EMA of activities (start small positive to avoid zero)
         self.lam = np.full(self.m, 1e-6)
         # initialize the y_0. with shape (batch_size, m)
 
-
     # ---------- helpers ----------
-        # ---------- NEW: reset ----------
-    def reset(self, seed: int | None = None):
-        """
-        Reinitialize the model to a fresh state.
-
-        Parameters
-        ----------
-        seed : int | None
-            - If None  -> reuse self.seed (reproducible reset if self.seed was set).
-            - If given -> use this seed for the new RNG.
-        """
-        # RNG
-        if seed is None:
-            seed = self.seed
-        self.rng = np.random.default_rng(seed)
-
-        # Reinitialize W exactly as in __init__
+    # ---------- NEW: reset ----------
+    def reset(self):
         W = self.rng.normal(size=(self.m, self.d))
         W /= np.linalg.norm(W, axis=1, keepdims=True) + 1e-12
         self.W = W
         self.initial_W = W.copy()
 
         # Reinitialize lateral q and EMA lam exactly as in __init__
-        self.q = np.zeros((self.m, self.m))
+        self.V = np.zeros((self.m, self.m))
         self.lam = np.full(self.m, 1e-6)
 
     # ---------- modified forward function to Y = Wx + Qy ----------
@@ -118,24 +101,24 @@ class LeenCompletePCA:
             # Y_t+1 = Z (feed-forward) + Y_t @ q.T (recurrent feedback)
             # The current activity Y is fed back through the lateral connections q
             # and added to the constant external drive Z.
-            Y = Z + Y @ self.q.T
+            Y = Z + Y @ self.V.T
         # Line 5: Return the final, settled activity after the loop.
         return Y
 
-    def _symmetrize_q(self):
-        self.q = 0.5 * (self.q + self.q.T)
-        np.fill_diagonal(self.q, 0.0)
+    def _symmetrize_V(self):
+        self.V = 0.5 * (self.V + self.V.T)
+        np.fill_diagonal(self.V, 0.0)
 
-    def _clip_q_spectral_norm(self):
-        if self.clip_q_spectral is None:
+    def _clip_V_spectral_norm(self):
+        if self.clip_V_spectral is None:
             return
         # Spectral norm via SVD
-        u, s, vt = np.linalg.svd(self.q, full_matrices=False)
+        u, s, vt = np.linalg.svd(self.V, full_matrices=False)
         smax = s[0]
-        if smax > self.clip_q_spectral:
-            s = s * (self.clip_q_spectral / (smax + 1e-12))
-            self.q = (u * s) @ vt
-            self._symmetrize_q()
+        if smax > self.clip_V_spectral:
+            s = s * (self.clip_V_spectral / (smax + 1e-12))
+            self.V = (u * s) @ vt
+            self._symmetrize_V()
     # ---------- public API ----------
 
     def step(self, X: np.ndarray):
@@ -157,13 +140,13 @@ class LeenCompletePCA:
         # ----- Lateral update (Activity-Dependent Anti-Hebbian) -----
         lam_sum = self.lam[:, None] + self.lam[None, :]  # (m, m) (λ_i + λ_j)
         # Implements Δq_ij = η_q * ( (λ_i + λ_j) * q_ij - C * <y_i y_j> )
-        dq = self.eta_q * (lam_sum * self.q - self.C * y_cov)
-        np.fill_diagonal(dq, 0.0)
-        self.q += dq
+        dV = self.eta_v * (lam_sum * self.V - self.C * y_cov)
+        np.fill_diagonal(dV, 0.0)
+        self.V += dV
 
-        if self.symmetrize_q:
-            self._symmetrize_q()
-        self._clip_q_spectral_norm()
+        if self.symmetrize_V:
+            self._symmetrize_V()
+        self._clip_V_spectral_norm()
 
         # ----- Forward update (Hebb-Oja on complete response) -----
         # Implements Δw = η_w * ( <y x^T> - Diag(<y y^T>) w )
@@ -510,6 +493,7 @@ def Y_aligned_training_testing_online(model, X, batch_size=1, alignment = "corr"
     similarity_list = []
     # get true PC scores
     PC_scores = get_pc_scores(X, true_pcs_rows(X, model.m))
+    print(f'W: {model.W}; V: {model.V}')
     for step in range(0, number_of_samples, batch_size):
         X_train = X[step:step+batch_size]
         model.step(X_train)
