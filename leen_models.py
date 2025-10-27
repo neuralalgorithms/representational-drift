@@ -272,11 +272,11 @@ def best_match_align_timeseries(Y, PCs, metric="corr", absolute=True, return_ali
     return perm, sims, S, signs
 
 
-def true_pcs_rows(X, m):
+def true_pcs_rows(X):
     """Return top-m PCs as ROWS (shape m x d)."""
     Xc = X - X.mean(axis=0, keepdims=True)
     U, S, VT = np.linalg.svd(Xc, full_matrices=False)
-    return VT[:m, :]  # rows are PCs
+    return VT  # rows are PCs
 
 def get_pc_scores(X, eigenvectors, m=None):
     Xc = X - X.mean(axis=0, keepdims=True)
@@ -466,7 +466,7 @@ def W_aligned_training_testing(model, X, batch_size=100):
 
     hist_best_corr = np.array(hist_best_corr)
     display_dict = {
-                f"neuron {i+1}": hist_best_corr[:, i] for i in range(model.m)
+                f"neuron {i+1}": hist_best_corr[:, i] for i in ordered_PCs
             }
 
     utils.visualize_alignment(list(display_dict.values()), list(display_dict.keys()), model.m, "batch")
@@ -480,7 +480,7 @@ def Y_aligned_training_testing(model, X, batch_size=1, alignment = "corr"):
     # post-training, re-compute outputs for all samples using the learned weights
     Y_output = model.transform(X)
     # get true PC scores
-    PC_scores = get_pc_scores(X, true_pcs_rows(X, model.d), m=model.m)
+    PC_scores = get_pc_scores(X, true_pcs_rows(X), m=model.m)
     order, similarity, _, _ = best_match_align_timeseries(Y_output, PC_scores, metric=alignment)
     # print(f"order = {order} | best|corr|= {np.round(similarity,3)}")
     return order, similarity
@@ -492,17 +492,23 @@ def Y_aligned_training_testing_online(model, X, batch_size=1, alignment = "corr"
     number_of_samples = X.shape[0]
     similarity_list = []
     # get true PC scores
-    PC_scores = get_pc_scores(X, true_pcs_rows(X, model.m))
-    print(f'W: {model.W}; V: {model.V}')
+    PC_scores = get_pc_scores(X, true_pcs_rows(X))
+    # print(f'W: {model.W}; V: {model.V}')
     for step in range(0, number_of_samples, batch_size):
         X_train = X[step:step+batch_size]
         model.step(X_train)
         # use the X_mask to incrementally reveal the input matrix, and update the model
         Y_output = model.transform(X)
-        order, similarity, _, _ = best_match_align_timeseries(Y_output, PC_scores, metric=alignment)
-        similarity_list.append(similarity)
+        order, similarity, _, _ = best_match_align_timeseries(Y_output, PC_scores[:,:model.m], metric=alignment)
         if step % 1000 == 0:
             print(f"step {step:4d} | order = {order} | best|corr|= {np.round(similarity,3)}")
+        # based on the order, sort the similarity to match PC order
+        combined_lists = zip(order, similarity)
+        # Sort the pairs based on PC_orders
+        sorted_combined_lists = sorted(combined_lists)
+        # Unzip the sorted pairs
+        _, ordered_similarity = zip(*sorted_combined_lists)
+        similarity_list.append(ordered_similarity)
     similarity_list = np.array(similarity_list)
     if graph:
         utils.visualize_alignment([similarity_list[:, i] for i in range(model.m)],
