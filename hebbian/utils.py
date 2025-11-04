@@ -9,7 +9,7 @@ from mpl_toolkits.mplot3d import Axes3D
 from scipy.stats import pearsonr
 from scipy.optimize import linear_sum_assignment
 import pandas as pd
-
+from matplotlib.lines import Line2D
 #--------------------------------
 # Statistical functions
 #--------------------------------
@@ -809,3 +809,110 @@ def averaged_training_testing_W(model, model_paras, X, runs = 10, batch_size=100
         plt.title('Mean Absolute Correlation with True PCs Across Runs')
         plt.show()
     return df_best_corr
+
+
+
+# --- helpers (same as before) ---
+def rotation_matrix_2d(phi_rad: float) -> np.ndarray:
+    c, s = np.cos(phi_rad), np.sin(phi_rad)
+    return np.array([[c, -s],
+                     [s,  c]])
+
+def rotate_cov_2d(Sigma: np.ndarray, phi_rad: float) -> np.ndarray:
+    R = rotation_matrix_2d(phi_rad)
+    Srot = R @ Sigma @ R.T
+    return 0.5 * (Srot + Srot.T)
+
+def eig_sorted(Sigma: np.ndarray):
+    w, V = np.linalg.eigh(Sigma)
+    idx = np.argsort(w)[::-1]
+    return w[idx], V[:, idx]
+
+def ellipse_xy_from_cov(Sigma: np.ndarray, n_std: float = 2.0, num: int = 400):
+    w, V = eig_sorted(Sigma)
+    radii = n_std * np.sqrt(np.maximum(w, 0))
+    t = np.linspace(0, 2*np.pi, num)
+    circle = np.vstack([np.cos(t), np.sin(t)])  # 2 x num
+    E = V @ np.diag(radii) @ circle
+    return E[0], E[1]
+
+def _plot_eigenvectors(ax, Sigma, color, label_prefix, alpha=0.95):
+    """
+    Plot BOTH eigenvectors (columns of V) scaled to 1σ (sqrt eigenvalues).
+    Solid line = eigvec 1 (largest λ), dashed line = eigvec 2.
+    Returns two Line2D proxy artists for the legend.
+    """
+    w, V = eig_sorted(Sigma)
+    styles = ["-", "--"]
+    labels = [f"{label_prefix} eigvec1 (λ₁)", f"{label_prefix} eigvec2 (λ₂)"]
+    proxies = []
+    for i in range(2):
+        v = V[:, i] * np.sqrt(w[i])  # length = 1σ along that axis
+        ax.plot([0, v[0]], [0, v[1]], styles[i], linewidth=2.2, color=color, alpha=alpha)
+        # add a faint opposite direction to hint at axis line (optional)
+        ax.plot([0, -v[0]], [0, -v[1]], styles[i], linewidth=1.2, color=color, alpha=0.35)
+        # proxy for legend (so we can style the legend line exactly)
+        proxies.append(Line2D([0], [0], linestyle=styles[i], color=color, lw=2.2, label=labels[i]))
+    return proxies
+
+
+def instantiate_before_after_X(Sigma, Sigma_rot, N = 2, seed: int = 0, n_samples: int = 600):
+    rng = np.random.default_rng(seed)
+    # shape of Sigma is (d, d)
+    d = np.shape(Sigma)[0]
+    _before = rng.multivariate_normal(np.zeros(d), Sigma, size=n_samples)
+    _after  = rng.multivariate_normal(np.zeros(d), Sigma_rot, size=n_samples)
+    if d == N:
+        X_before = _before
+        X_after  = _after
+        return X_before, X_after
+    elif N > d:
+        # use rng to generate a random matrix Q
+        Q, _ = np.linalg.qr(rng.standard_normal((N, d)))
+        A = Q[:, :d]
+        # generate N-d data by projecting d-d data onto an N-d space
+        X_before = _before @ A.T
+        X_after  = _after @ A.T
+        return X_before, X_after
+    else:
+        raise ValueError(f"Sigma has {d} dimensions, expected {N}")
+
+# --- one-figure comparison with BOTH eigenvectors ---
+def before_after_distribution(Sigma, Sigma_rot, phi_deg: float, N: int = 2, seed: int = 0,
+                                       n_samples: int = 600, show_samples: bool = True):
+    X_before, X_after = instantiate_before_after_X(Sigma, Sigma_rot, N=N, seed=seed, n_samples=n_samples)
+
+    # ex1, ey1 = ellipse_xy_from_cov(Sigma, n_std=2.0)
+    # ex2, ey2 = ellipse_xy_from_cov(Sigma_rot, n_std=2.0)
+
+
+    # scatter samples (optional)
+    if show_samples:
+        fig, ax = plt.subplots(figsize=(7, 6))
+        ax.scatter(X_before[:,0], X_before[:,1], s=8, alpha=0.25, color="tab:blue",  label="samples (before)")
+        ax.scatter(X_after[:,0],  X_after[:,1],  s=8, alpha=0.25, color="tab:orange", label="samples (after)")
+
+    # 2σ ellipses
+    # l1, = ax.plot(ex1, ey1, lw=2.2, color="tab:blue",  label="ellipse 2σ (before)")
+    # l2, = ax.plot(ex2, ey2, lw=2.2, color="tab:orange", label=f"ellipse 2σ (after, φ={phi_deg}°)")
+
+    # BOTH eigenvectors for each covariance
+    proxies_b = _plot_eigenvectors(ax, Sigma,     color="tab:blue",  label_prefix="before")
+    proxies_a = _plot_eigenvectors(ax, Sigma_rot, color="tab:orange", label_prefix="after")
+
+    # assemble legend
+    legend_items = []
+    if show_samples:
+        legend_items += [Line2D([0],[0], marker='o', linestyle='None', color="tab:blue",  alpha=0.25, label="samples (before)"),
+                         Line2D([0],[0], marker='o', linestyle='None', color="tab:orange", alpha=0.25, label="samples (after)")]
+    # legend_items += [l1, l2] + proxies_b + proxies_a
+    ax.legend(handles=legend_items, loc="best")
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title("Before vs After rotation — both eigenvectors per covariance")
+    ax.set_xlabel("x1"); ax.set_ylabel("x2")
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+    fig.tight_layout()
+    plt.show()
+    return X_before, X_after
+
