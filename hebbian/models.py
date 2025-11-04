@@ -4,7 +4,6 @@ HebbianModels.py
 Base implementations of Hebbian Learning Models including Oja and Sanger networks.
 """
 
-from calendar import c
 import numpy as np
 from abc import ABC, abstractmethod
 from typing import Optional, Any
