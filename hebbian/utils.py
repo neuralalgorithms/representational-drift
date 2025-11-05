@@ -7,7 +7,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.stats import pearsonr
-
+from scipy.optimize import linear_sum_assignment
+import pandas as pd
+from matplotlib.lines import Line2D
 #--------------------------------
 # Statistical functions
 #--------------------------------
@@ -54,7 +56,6 @@ def pca_topk(X, k, center=True):
 
 def random_vector_chance_prob(input_size):
     return np.sqrt(2/(np.pi * input_size))
-
 
 #--------------------------------
 # Training and testing functions
@@ -210,7 +211,6 @@ def estimate_output_variances(X, weights, center=True, unit_weights=True):
 
     Y = W@X.T                   # (k, n) x (n, samples)
     return Y.var(axis=1, ddof=1)
-
 
 #--------------------------------
 # Data simulation functions
@@ -433,10 +433,486 @@ def plot_samples_and_top3_pcs_3d(X, center=True, scale=2.5, annotate=True, ax=No
     return {"pcs": V, "eigvals": eigvals, "mean": mean}
 
 
-def main():
-    """Run example usage of the tools."""
-    # Example usage code here
-    pass
 
-if __name__ == "__main__":
-    main()
+
+# --- PCA alignment helpers ---
+def best_match_alignment(W_rows, PC_rows):
+    """
+    W_rows: (m, d) learned components, row-normalized
+    PC_rows: (m, d) true PCs, row-normalized in descending variance order
+    Returns:
+      perm: indices of PCs assigned to each W row
+      corrs: absolute correlations after optimal assignment
+      C: full |cosine| matrix (m x m)
+    """
+    # normalize
+    Wn = W_rows / (np.linalg.norm(W_rows, axis=1, keepdims=True) + 1e-12)
+    PCn = PC_rows / (np.linalg.norm(PC_rows, axis=1, keepdims=True) + 1e-12)
+    # cosine matrix
+    C = np.abs(Wn @ PCn.T)
+
+        # Hungarian solves a min-cost problem; convert to cost = 1 - C
+    r, c = linear_sum_assignment(1.0 - C)
+
+    return c, C[np.arange(C.shape[0]), c], C
+
+def best_match_align_timeseries(Y, PCs, metric="corr", absolute=True, return_aligned=False):
+    """
+    Match columns of Y to columns of PCs by maximizing pairwise similarity.
+
+    Parameters
+    ----------
+    Y : array-like, shape (n_samples, m)
+        Model outputs; each column is a component across samples.
+    PCs : array-like, shape (n_samples, m)
+        Principal component *scores* (or any reference components), column-wise.
+    metric : {"corr", "cosine"}, default "corr"
+        Similarity to maximize. "corr" = Pearson correlation (column-wise, mean-centered);
+        "cosine" = cosine similarity (L2-normalized columns).
+    absolute : bool, default True
+        If True, ignore sign (common with PCA). If False, keep signed similarity.
+    return_aligned : bool, default False
+        If True, also return (Y_aligned, PCs_perm) where Y columns are sign-flipped
+        and PCs are permuted to the best match order.
+
+    Returns
+    -------
+    perm : ndarray, shape (m,)
+        For each Y column i, PC column index perm[i] is the best match.
+    sims : ndarray, shape (m,)
+        Similarity values for those matches (abs or signed per `absolute`).
+    S : ndarray, shape (m, m)
+        Full similarity matrix where S[i, j] compares Y[:, i] vs PCs[:, j].
+    signs : ndarray, shape (m,)
+        Orientation (+1/-1) to multiply Y[:, i] so it aligns with PCs[:, perm[i]].
+    (optional) Y_aligned, PCs_perm
+        Returned only if return_aligned=True.
+    """
+    Y = np.asarray(Y, dtype=float)
+    PCs = np.asarray(PCs, dtype=float)
+    if Y.shape != PCs.shape or Y.ndim != 2:
+        raise ValueError("Y and PCs must have identical shape (n_samples, m).")
+
+    n, m = Y.shape
+
+    def _zscore(A):
+        mu = A.mean(axis=0, keepdims=True)
+        sd = A.std(axis=0, ddof=1, keepdims=True)
+        sd = np.where(sd == 0.0, 1.0, sd)
+        return (A - mu) / sd
+
+    if metric == "corr":
+        Yz, PCz = _zscore(Y), _zscore(PCs)
+        # correlation matrix between columns
+        S = (Yz.T @ PCz) / (n - 1)
+    elif metric == "cosine":
+        Yn = Y / (np.linalg.norm(Y, axis=0, keepdims=True) + 1e-12)
+        PCn = PCs / (np.linalg.norm(PCs, axis=0, keepdims=True) + 1e-12)
+        S = Yn.T @ PCn
+    else:
+        raise ValueError("metric must be 'corr' or 'cosine'.")
+
+    S_use = np.abs(S) if absolute else S
+
+    # Solve the max-sum assignment (Hungarian solves min-cost; convert similarity to cost)
+    row_ind, col_ind = linear_sum_assignment(1.0 - S_use)
+    perm = np.empty(m, dtype=int)
+    perm[row_ind] = col_ind
+
+    sims = S_use[np.arange(m), perm]
+    signs = np.sign(S[np.arange(m), perm])  # orientation from *signed* S
+    signs[signs == 0] = 1
+
+    if return_aligned:
+        Y_aligned = Y * signs  # broadcast flips per column
+        PCs_perm = PCs[:, perm]
+        return perm, sims, S, signs, Y_aligned, PCs_perm
+
+    return perm, sims, S, signs
+
+
+def true_pcs_rows(X):
+    """Return top-m PCs as ROWS (shape m x d)."""
+    Xc = X - X.mean(axis=0, keepdims=True)
+    U, S, VT = np.linalg.svd(Xc, full_matrices=False)
+    return VT  # rows are PCs
+
+def get_pc_scores(X, eigenvectors, m=None):
+    Xc = X - X.mean(axis=0, keepdims=True)
+    PC_scores = Xc @ eigenvectors
+    if m is not None:
+        PC_scores = PC_scores[:, :m]
+    return PC_scores
+
+
+def subspace_max_angle_deg(W_rows, PC_rows):
+    """Largest principal angle between the two m-dim subspaces (in degrees)."""
+    # Orthonormal bases for colspaces of W^T and PC^T
+    Qw, _ = np.linalg.qr(W_rows.T)
+    Qp, _ = np.linalg.qr(PC_rows.T)
+    s = np.linalg.svd(Qw.T @ Qp, compute_uv=False)
+    return float(np.degrees(np.arccos(np.clip(s.min(), -1.0, 1.0))))
+
+
+def compute_eigen_decomposition(X, center_data=True, return_covariance=False):
+    """
+    Compute eigenvalues and eigenvectors from input data X.
+    
+    Parameters
+    ----------
+    X : array-like, shape (n_samples, n_features)
+        Input data matrix
+    center_data : bool, default=True
+        Whether to center the data (subtract mean) before computing covariance
+    return_covariance : bool, default=False
+        Whether to also return the covariance matrix
+        
+    Returns
+    -------
+    eigenvalues : ndarray, shape (n_features,)
+        Eigenvalues in descending order
+    eigenvectors : ndarray, shape (n_features, n_features)
+        Eigenvectors as columns (each column is an eigenvector)
+    covariance : ndarray, shape (n_features, n_features), optional
+        Covariance matrix (only returned if return_covariance=True)
+    """
+    X = np.asarray(X, dtype=float)
+    
+    # Center the data if requested
+    if center_data:
+        X_centered = X - X.mean(axis=0, keepdims=True)
+    else:
+        X_centered = X
+    
+    # Compute covariance matrix
+    n_samples = X_centered.shape[0]
+    covariance = (X_centered.T @ X_centered) / (n_samples - 1)
+    
+    # Compute eigenvalues and eigenvectors
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    
+    # Sort in descending order (largest eigenvalues first)
+    idx = np.argsort(eigenvalues)[::-1]
+    eigenvalues = eigenvalues[idx]
+    eigenvectors = eigenvectors[:, idx]
+    
+    if return_covariance:
+        return eigenvalues, eigenvectors, covariance
+    else:
+        return eigenvalues, eigenvectors
+
+# ------ Data generation helpers ------
+
+def generate_covariance_matrix(dim, method='random', eigenvalues=None, condition_number=None, seed=None):
+    """
+    Generate a symmetric positive-semidefinite covariance matrix.
+    
+    Parameters
+    ----------
+    dim : int
+        Dimension of the covariance matrix (dim x dim)
+    method : str, default='random'
+        Method to generate the matrix:
+        - 'random': Random positive definite matrix
+        - 'eigenvalues': Use specified eigenvalues
+        - 'condition': Use specified condition number
+        - 'toeplitz': Toeplitz matrix (correlation decreases with distance)
+        - 'block': Block diagonal structure
+    eigenvalues : array-like, optional
+        Specific eigenvalues to use (must be non-negative)
+    condition_number : float, optional
+        Condition number (max_eigenval / min_eigenval) for 'condition' method
+    seed : int, optional
+        Random seed for reproducibility
+        
+    Returns
+    -------
+    cov : ndarray, shape (dim, dim)
+        Symmetric positive-semidefinite covariance matrix
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    
+    if method == 'random':
+        # Method 1: Random positive definite matrix
+        A = np.random.randn(dim, dim)
+        cov = A @ A.T  # This ensures positive semidefinite
+        # Add diagonal to ensure positive definite
+        cov += np.eye(dim) * 0.1
+        
+    elif method == 'eigenvalues':
+        # Method 2: Use specified eigenvalues
+        if eigenvalues is None:
+            eigenvalues = np.linspace(1.0, 0.1, dim)
+        eigenvalues = np.asarray(eigenvalues)
+        assert len(eigenvalues) == dim, "Eigenvalues length must match dimension"
+        assert np.all(eigenvalues >= 0), "All eigenvalues must be non-negative"
+        
+        # Generate random orthogonal matrix
+        Q, _ = np.linalg.qr(np.random.randn(dim, dim))
+        cov = Q @ np.diag(eigenvalues) @ Q.T
+        
+    elif method == 'condition':
+        # Method 3: Use specified condition number
+        if condition_number is None:
+            condition_number = 10.0
+        assert condition_number >= 1.0, "Condition number must be >= 1"
+        
+        # Generate eigenvalues with specified condition number
+        max_eigenval = 1.0
+        min_eigenval = max_eigenval / condition_number
+        eigenvalues = np.linspace(max_eigenval, min_eigenval, dim)
+        
+        # Generate random orthogonal matrix
+        Q, _ = np.linalg.qr(np.random.randn(dim, dim))
+        cov = Q @ np.diag(eigenvalues) @ Q.T
+        
+    elif method == 'toeplitz':
+        # Method 4: Toeplitz matrix (correlation structure)
+        rho = 0.7  # correlation parameter
+        cov = np.zeros((dim, dim))
+        for i in range(dim):
+            for j in range(dim):
+                cov[i, j] = rho ** abs(i - j)
+        # Scale to have unit diagonal
+        cov = cov / np.diag(cov)[:, None]
+        
+    elif method == 'block':
+        # Method 5: Block diagonal structure
+        block_size = min(3, dim)
+        cov = np.zeros((dim, dim))
+        
+        for i in range(0, dim, block_size):
+            end_idx = min(i + block_size, dim)
+            block_dim = end_idx - i
+            if block_dim > 1:
+                # Create a small positive definite block
+                A = np.random.randn(block_dim, block_dim)
+                block = A @ A.T + np.eye(block_dim) * 0.1
+                cov[i:end_idx, i:end_idx] = block
+            else:
+                cov[i, i] = 1.0
+                
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    
+    # Ensure symmetry (should already be symmetric, but just in case)
+    cov = (cov + cov.T) / 2
+    
+    return cov
+
+def generate_samples(d, number_of_samples):
+    mu = np.full(d, 0.0)
+    cov = generate_covariance_matrix(d, method='random')
+    samples = np.random.multivariate_normal(mu, cov, size=number_of_samples)
+    samples -= samples.mean(axis=0, keepdims=True)
+    return samples
+
+#---------- Traing and Testing helper ------------------
+def W_aligned_training_testing(model, X, batch_size=100):
+    hist_best_corr = []
+    number_of_samples = X.shape[0]
+    for step in range(0, number_of_samples, batch_size):
+        X_train = X[step:step+batch_size]
+        model.step(X_train)
+        # cosine-monitor every {batch_size} steps (optional)
+        if step % batch_size == 0:
+            W = model.components_
+            PC = true_pcs_rows(X, model.m)
+            ordered_PCs , best_corrs, _ = best_match_alignment(W, PC)
+            hist_best_corr.append(best_corrs)
+            print(f"step {step:4d} | order = {ordered_PCs} | best|corr|={np.round(best_corrs,3)}")
+
+    hist_best_corr = np.array(hist_best_corr)
+    display_dict = {
+                f"neuron {i+1}": hist_best_corr[:, i] for i in ordered_PCs
+            }
+
+    visualize_alignment(list(display_dict.values()), list(display_dict.keys()), model.m, "batch")
+
+
+def Y_aligned_training_testing(model, X, batch_size=1, alignment = "corr"):
+    number_of_samples = X.shape[0]
+    for step in range(0, number_of_samples, batch_size):
+        X_train = X[step:step+batch_size]
+        model.step(X_train)
+    # post-training, re-compute outputs for all samples using the learned weights
+    Y_output = model.transform(X)
+    # get true PC scores
+    PC_scores = get_pc_scores(X, true_pcs_rows(X), m=model.m)
+    order, similarity, _, _ = best_match_align_timeseries(Y_output, PC_scores, metric=alignment)
+    # print(f"order = {order} | best|corr|= {np.round(similarity,3)}")
+    return order, similarity
+
+
+
+# ---------- Online training testing ------------------
+def Y_aligned_training_testing_online(model, X, batch_size=1, alignment = "corr", graph=True):
+    number_of_samples = X.shape[0]
+    similarity_list = []
+    # get true PC scores
+    PC_scores = get_pc_scores(X, true_pcs_rows(X))
+    # print(f'W: {model.W}; V: {model.V}')
+    for step in range(0, number_of_samples, batch_size):
+        X_train = X[step:step+batch_size]
+        model.step(X_train)
+        # use the X_mask to incrementally reveal the input matrix, and update the model
+        Y_output = model.transform(X)
+        order, similarity, _, _ = best_match_align_timeseries(Y_output, PC_scores[:,:model.m], metric=alignment)
+        if step % 1000 == 0:
+            print(f"step {step:4d} | order = {order} | best|corr|= {np.round(similarity,3)}")
+        # based on the order, sort the similarity to match PC order
+        combined_lists = zip(order, similarity)
+        # Sort the pairs based on PC_orders
+        sorted_combined_lists = sorted(combined_lists)
+        # Unzip the sorted pairs
+        _, ordered_similarity = zip(*sorted_combined_lists)
+        similarity_list.append(ordered_similarity)
+    similarity_list = np.array(similarity_list)
+    if graph:
+        visualize_alignment([similarity_list[:, i] for i in range(model.m)],
+                                    [f"Neuron {i+1}" for i in range(model.m)],
+                                    model.m, "trials")
+    return order, similarity
+
+
+# ---------- Averaged training testing ------------------
+def averaged_training_testing_W(model, model_paras, X, runs = 10, batch_size=100, graph=True):
+    df_best_corr = pd.DataFrame(data=np.full((runs, model_paras['output_dim'] ), np.nan), 
+                                columns=[f"PC_{i+1}" for i in range(model_paras['output_dim'])],
+                                index=[f"run_{i+1}" for i in range(runs)])
+    number_of_samples = X.shape[0]
+    for run in range(runs):
+        _model = model(**model_paras)  # re-initialize model for each run if needed
+        for step in range(0, number_of_samples, batch_size):
+            X_train = X[step:step+batch_size]
+            _model.step(X_train)
+            W = _model.components_
+            PC = true_pcs_rows(X, _model.m)
+            ordered_PCs, best_corrs, _ = best_match_alignment(W, PC)
+        # based on the order_PCs, sort the best_corrs to match PC order
+        combined_lists = zip(ordered_PCs, best_corrs)
+        # Sort the pairs based on PC_orders
+        sorted_combined_lists = sorted(combined_lists)
+        # Unzip the sorted pairs
+        _, sorted_best_corrs = zip(*sorted_combined_lists)
+        df_best_corr.iloc[run, :] = sorted_best_corrs
+        print(f"run {run+1:2d} | order = {ordered_PCs} | best|corr|={np.round(best_corrs,3)}")
+    if graph:
+        # plot the bar graph with error bars of mean and std based on df_best_corr
+        means = df_best_corr.mean(axis=0)
+        stds = df_best_corr.std(axis=0)
+        plt.figure(figsize=(10, 6))
+        plt.bar(means.index, means.values, yerr=stds.values, capsize=5)
+        # plt.ylim(0, 1.1)
+        plt.ylabel('Mean Absolute Correlation')
+        plt.title('Mean Absolute Correlation with True PCs Across Runs')
+        plt.show()
+    return df_best_corr
+
+
+
+# --- helpers (same as before) ---
+def rotation_matrix_2d(phi_rad: float) -> np.ndarray:
+    c, s = np.cos(phi_rad), np.sin(phi_rad)
+    return np.array([[c, -s],
+                     [s,  c]])
+
+def rotate_cov_2d(Sigma: np.ndarray, phi_rad: float) -> np.ndarray:
+    R = rotation_matrix_2d(phi_rad)
+    Srot = R @ Sigma @ R.T
+    return 0.5 * (Srot + Srot.T)
+
+def eig_sorted(Sigma: np.ndarray):
+    w, V = np.linalg.eigh(Sigma)
+    idx = np.argsort(w)[::-1]
+    return w[idx], V[:, idx]
+
+def ellipse_xy_from_cov(Sigma: np.ndarray, n_std: float = 2.0, num: int = 400):
+    w, V = eig_sorted(Sigma)
+    radii = n_std * np.sqrt(np.maximum(w, 0))
+    t = np.linspace(0, 2*np.pi, num)
+    circle = np.vstack([np.cos(t), np.sin(t)])  # 2 x num
+    E = V @ np.diag(radii) @ circle
+    return E[0], E[1]
+
+def _plot_eigenvectors(ax, Sigma, color, label_prefix, alpha=0.95):
+    """
+    Plot BOTH eigenvectors (columns of V) scaled to 1σ (sqrt eigenvalues).
+    Solid line = eigvec 1 (largest λ), dashed line = eigvec 2.
+    Returns two Line2D proxy artists for the legend.
+    """
+    w, V = eig_sorted(Sigma)
+    styles = ["-", "--"]
+    labels = [f"{label_prefix} eigvec1 (λ₁)", f"{label_prefix} eigvec2 (λ₂)"]
+    proxies = []
+    for i in range(2):
+        v = V[:, i] * np.sqrt(w[i])  # length = 1σ along that axis
+        ax.plot([0, v[0]], [0, v[1]], styles[i], linewidth=2.2, color=color, alpha=alpha)
+        # add a faint opposite direction to hint at axis line (optional)
+        ax.plot([0, -v[0]], [0, -v[1]], styles[i], linewidth=1.2, color=color, alpha=0.35)
+        # proxy for legend (so we can style the legend line exactly)
+        proxies.append(Line2D([0], [0], linestyle=styles[i], color=color, lw=2.2, label=labels[i]))
+    return proxies
+
+
+def instantiate_before_after_X(Sigma, Sigma_rot, N = 2, seed: int = 0, n_samples: int = 600):
+    rng = np.random.default_rng(seed)
+    # shape of Sigma is (d, d)
+    d = np.shape(Sigma)[0]
+    _before = rng.multivariate_normal(np.zeros(d), Sigma, size=n_samples)
+    _after  = rng.multivariate_normal(np.zeros(d), Sigma_rot, size=n_samples)
+    if d == N:
+        X_before = _before
+        X_after  = _after
+        return X_before, X_after
+    elif N > d:
+        # use rng to generate a random matrix Q
+        Q, _ = np.linalg.qr(rng.standard_normal((N, d)))
+        A = Q[:, :d]
+        # generate N-d data by projecting d-d data onto an N-d space
+        X_before = _before @ A.T
+        X_after  = _after @ A.T
+        return X_before, X_after
+    else:
+        raise ValueError(f"Sigma has {d} dimensions, expected {N}")
+
+# --- one-figure comparison with BOTH eigenvectors ---
+def before_after_distribution(Sigma, Sigma_rot, phi_deg: float, N: int = 2, seed: int = 0,
+                                       n_samples: int = 600, show_samples: bool = True):
+    X_before, X_after = instantiate_before_after_X(Sigma, Sigma_rot, N=N, seed=seed, n_samples=n_samples)
+
+    # ex1, ey1 = ellipse_xy_from_cov(Sigma, n_std=2.0)
+    # ex2, ey2 = ellipse_xy_from_cov(Sigma_rot, n_std=2.0)
+
+
+    # scatter samples (optional)
+    if show_samples:
+        fig, ax = plt.subplots(figsize=(7, 6))
+        ax.scatter(X_before[:,0], X_before[:,1], s=8, alpha=0.25, color="tab:blue",  label="samples (before)")
+        ax.scatter(X_after[:,0],  X_after[:,1],  s=8, alpha=0.25, color="tab:orange", label="samples (after)")
+
+    # 2σ ellipses
+    # l1, = ax.plot(ex1, ey1, lw=2.2, color="tab:blue",  label="ellipse 2σ (before)")
+    # l2, = ax.plot(ex2, ey2, lw=2.2, color="tab:orange", label=f"ellipse 2σ (after, φ={phi_deg}°)")
+
+    # BOTH eigenvectors for each covariance
+    proxies_b = _plot_eigenvectors(ax, Sigma,     color="tab:blue",  label_prefix="before")
+    proxies_a = _plot_eigenvectors(ax, Sigma_rot, color="tab:orange", label_prefix="after")
+
+    # assemble legend
+    legend_items = []
+    if show_samples:
+        legend_items += [Line2D([0],[0], marker='o', linestyle='None', color="tab:blue",  alpha=0.25, label="samples (before)"),
+                         Line2D([0],[0], marker='o', linestyle='None', color="tab:orange", alpha=0.25, label="samples (after)")]
+    # legend_items += [l1, l2] + proxies_b + proxies_a
+    ax.legend(handles=legend_items, loc="best")
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title("Before vs After rotation — both eigenvectors per covariance")
+    ax.set_xlabel("x1"); ax.set_ylabel("x2")
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+    fig.tight_layout()
+    plt.show()
+    return X_before, X_after
+
