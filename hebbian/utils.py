@@ -456,7 +456,7 @@ def best_match_alignment(W_rows, PC_rows):
 
     return c, C[np.arange(C.shape[0]), c], C
 
-def best_match_align_timeseries(Y, PCs, metric="corr", absolute=True, return_aligned=False):
+def best_match_align_timeseries(Y, PCs, metric="cov", absolute=True, return_aligned=False):
     """
     Match columns of Y to columns of PCs by maximizing pairwise similarity.
 
@@ -500,11 +500,21 @@ def best_match_align_timeseries(Y, PCs, metric="corr", absolute=True, return_ali
         sd = A.std(axis=0, ddof=1, keepdims=True)
         sd = np.where(sd == 0.0, 1.0, sd)
         return (A - mu) / sd
+        
+    def _center(A):
+        """Center columns by subtracting mean."""
+        return A - A.mean(axis=0, keepdims=True)
 
     if metric == "corr":
         Yz, PCz = _zscore(Y), _zscore(PCs)
         # correlation matrix between columns
         S = (Yz.T @ PCz) / (n - 1)
+    elif metric == "cov":
+        # Center both Y and PCs
+        Yc = _center(Y)
+        PCc = _center(PCs)
+        # Cross-covariance matrix: S[i, j] = Cov(Y[:, i], PCs[:, j])
+        S = (Yc.T @ PCc) / (n - 1)
     elif metric == "cosine":
         Yn = Y / (np.linalg.norm(Y, axis=0, keepdims=True) + 1e-12)
         PCn = PCs / (np.linalg.norm(PCs, axis=0, keepdims=True) + 1e-12)
@@ -747,11 +757,11 @@ def Y_aligned_training_testing(model, X, batch_size=1, alignment = "corr"):
 
 
 # ---------- Online training testing ------------------
-def Y_aligned_training_testing_online(model, X, batch_size=1, alignment = "corr", graph=True):
+def Y_aligned_training_testing_online(model, X, batch_size=1, alignment = "cov", graph=True):
     number_of_samples = X.shape[0]
     similarity_list = []
     # get true PC scores
-    PC_scores = get_pc_scores(X, true_pcs_rows(X))
+    PC_scores = get_pc_scores(X, true_pcs_rows(X), m=model.m)
     # print(f'W: {model.W}; V: {model.V}')
     for step in range(0, number_of_samples, batch_size):
         X_train = X[step:step+batch_size]
@@ -813,15 +823,88 @@ def averaged_training_testing_W(model, model_paras, X, runs = 10, batch_size=100
 
 
 # --- helpers (same as before) ---
-def rotation_matrix_2d(phi_rad: float) -> np.ndarray:
-    c, s = np.cos(phi_rad), np.sin(phi_rad)
-    return np.array([[c, -s],
-                     [s,  c]])
 
-def rotate_cov_2d(Sigma: np.ndarray, phi_rad: float) -> np.ndarray:
-    R = rotation_matrix_2d(phi_rad)
+def rotation_matrix_nd(d: int, axis1: int, axis2: int, phi_rad: float) -> np.ndarray:
+    """
+    Generate a rotation matrix in d-dimensional space that rotates in the plane
+    spanned by axis1 and axis2.
+    
+    Parameters
+    ----------
+    d : int
+        Dimension of the space
+    axis1 : int
+        First axis of the rotation plane (0-indexed)
+    axis2 : int
+        Second axis of the rotation plane (0-indexed)
+    phi_rad : float
+        Rotation angle in radians
+        
+    Returns
+    -------
+    R : ndarray, shape (d, d)
+        Rotation matrix
+    """
+    if axis1 == axis2:
+        raise ValueError("axis1 and axis2 must be different")
+    if not (0 <= axis1 < d and 0 <= axis2 < d):
+        raise ValueError(f"axes must be in [0, {d-1}]")
+    
+    R = np.eye(d)
+    c, s = np.cos(phi_rad), np.sin(phi_rad)
+    
+    # Set the 2x2 rotation block in the plane
+    R[axis1, axis1] = c
+    R[axis1, axis2] = -s
+    R[axis2, axis1] = s
+    R[axis2, axis2] = c
+    
+    return R
+
+
+def rotate_cov_nd(Sigma: np.ndarray, phi_rad: float, axis1: int = 0, axis2: int = 1, 
+                  rotation_matrix: np.ndarray = None) -> np.ndarray:
+    """
+    Rotate a covariance matrix in n-dimensional space.
+    
+    Parameters
+    ----------
+    Sigma : ndarray, shape (d, d)
+        Covariance matrix to rotate
+    phi_rad : float
+        Rotation angle in radians (ignored if rotation_matrix is provided)
+    axis1 : int, default=0
+        First axis of the rotation plane (ignored if rotation_matrix is provided)
+    axis2 : int, default=1
+        Second axis of the rotation plane (ignored if rotation_matrix is provided)
+    rotation_matrix : ndarray, shape (d, d), optional
+        If provided, use this rotation matrix directly. Overrides axis1, axis2, phi_rad.
+        
+    Returns
+    -------
+    Sigma_rot : ndarray, shape (d, d)
+        Rotated covariance matrix (symmetric)
+    """
+    Sigma = np.asarray(Sigma, dtype=float)
+    d = Sigma.shape[0]
+    
+    if Sigma.shape != (d, d):
+        raise ValueError(f"Sigma must be square, got shape {Sigma.shape}")
+    
+    # Use provided rotation matrix or generate one
+    if rotation_matrix is not None:
+        R = np.asarray(rotation_matrix, dtype=float)
+        if R.shape != (d, d):
+            raise ValueError(f"rotation_matrix must be ({d}, {d}), got {R.shape}")
+    else:
+        R = rotation_matrix_nd(d, axis1, axis2, phi_rad)
+    
+    # Rotate: R @ Sigma @ R.T
     Srot = R @ Sigma @ R.T
+    
+    # Ensure symmetry (numerical stability)
     return 0.5 * (Srot + Srot.T)
+
 
 def eig_sorted(Sigma: np.ndarray):
     w, V = np.linalg.eigh(Sigma)

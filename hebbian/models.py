@@ -120,6 +120,44 @@ class HebbianModel(ABC):
             "weight_shape": self.W.shape
         }
 
+    @property
+    def m(self):
+        """Alias for output_size to match LeenCompletePCA interface."""
+        return self.output_size
+    
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        """
+        Project X onto learned components.
+        
+        Args:
+            X: Input samples of shape (n_samples, n_features) or (n_features,)
+        Returns:
+            np.ndarray: Output of shape (n_samples, output_size) or (output_size,)
+        """
+        X = np.asarray(X, dtype=float)
+        if X.ndim == 1:
+            # Single sample
+            return self.forward(X)
+        elif X.ndim == 2:
+            # Batch of samples: (n_samples, n_features)
+            if self.input_size is None:
+                self.input_size = X.shape[1]
+                self.W = 0.01 * self.rng.standard_normal((self.output_size, self.input_size))
+            # Project each sample: W @ X.T gives (output_size, n_samples)
+            # Transpose to get (n_samples, output_size)
+            return (self.W @ X.T).T
+        else:
+            raise ValueError(f"X must be 1D or 2D, got shape {X.shape}")
+    
+    def reset(self):
+        """
+        Reset the model to initial random weights.
+        Useful for multiple training runs.
+        """
+        if self.input_size is not None:
+            self.W = 0.01 * self.rng.standard_normal((self.output_size, self.input_size))
+        # Note: input_size stays the same, only weights are reset
+
 class OjaNetwork(HebbianModel):
     """
     Implementation of Oja's learning rule for principal component analysis.
