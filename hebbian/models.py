@@ -226,7 +226,7 @@ class LeenCompletePCA:
     Equations of Motion (ensemble average form):
     -------------------------------------------
     Forward Pass (Eq. 33):
-        y_{t+1} = W(t) x_t + q(t) y_t
+        y = W x + q y
         (iterated for a fixed number of settling steps)
 
     Forward Weight Update (Eq. 35):
@@ -295,7 +295,7 @@ class LeenCompletePCA:
     def _forward(self, X: np.ndarray) -> np.ndarray:
         """
         Calculates the cell response by iteratively simulating the fast dynamics.
-        y_{t+1} = W(t) x_t + q(t) * y_t
+        y = W x + q y
         """
         # Line 1: Calculate the constant feed-forward input drive, Z = Wx
         # This is the external input to the recurrent system.
@@ -309,7 +309,7 @@ class LeenCompletePCA:
         
         for _ in range(self.settling_steps):
             # Line 4: Calculate the next state of neural activity.
-            # Y_t+1 = Z (feed-forward) + Y_t @ q.T (recurrent feedback)
+            # Y = Z (feed-forward) + Y @ q.T (recurrent feedback)
             # The current activity Y is fed back through the lateral connections q
             # and added to the constant external drive Z.
             Y = Z + Y @ self.V.T
@@ -517,3 +517,387 @@ class LeenMinimalPCA:
         "Rows of W are the learned components (unit-norm). Shape: (m, d)"
         return self.W.copy()
 
+
+class OneShotLeenCompletePCA:
+    """
+    One-shot variant of Leen's "complete" PCA model.
+
+    Instead of recurrent settling y_{t+1} = Wx + V y_t, this model
+    uses a single lateral pass on the feedforward output:
+
+        Y' = W X                      (feedforward drive)
+        Y  = Y' + V Y' = (I + V) W X  (one-shot lateral interaction)
+
+    The effective linear mapping is:
+
+        A = (I + V) W
+        Y = A X
+
+    Learning rules follow the same *form* as LeenCompletePCA:
+
+      - Lateral (activity-dependent anti-Hebbian):
+            ΔV_ij = η_v * ( (λ_i + λ_j) * V_ij - C * <y_i y_j> ), i ≠ j
+        where λ_i is an EMA of y_i^2.
+
+      - Feedforward (Hebb–Oja on the complete response Y):
+            ΔW = η_w * ( <Y X^T> - Diag(<y y^T>) W )
+
+    Parameters
+    ----------
+    input_dim : int
+    output_dim : int
+    eta_w : float
+        Learning rate for feedforward weights W.
+    eta_v : float
+        Learning rate for lateral connections V (typically > eta_w).
+    C : float
+        Coupling constant in the V update (e.g. > 1).
+    ema_alpha : float
+        EMA step for λ_i ≈ E[y_i^2].
+    symmetrize_V : bool
+        If True, keep V symmetric with zero diagonal after each step.
+    seed : int or None
+        Random seed for weight initialization.
+    settling_steps, noise_level, clip_V_spectral : kept for API
+        compatibility with LeenCompletePCA. settling_steps and
+        noise_level are not used in the one-shot forward dynamics,
+        but clip_V_spectral is still used to stabilize V.
+    """
+    def __init__(self,
+                 input_dim: int, output_dim: int,
+                 eta_w: float = 1e-3,
+                 eta_v: float = 1e-2,
+                 C: float = 1.5,
+                 ema_alpha: float = 0.05,
+                 symmetrize_V: bool = True,
+                 seed: int | None = 0,
+                 settling_steps: int = 1,      # kept for interface
+                 noise_level: float = 0.0,     # unused here
+                 clip_V_spectral: float | None = 0.95):
+        self.d = input_dim
+        self.m = output_dim
+        self.eta_w = eta_w
+        self.eta_v = eta_v
+        self.C = C
+        self.ema_alpha = ema_alpha
+        self.symmetrize_V = symmetrize_V
+        self.settling_steps = settling_steps
+        self.noise_level = noise_level
+        self.clip_V_spectral = clip_V_spectral
+
+        self.rng = np.random.default_rng(seed)
+
+        # Initialize W with unit-norm rows
+        W = self.rng.normal(size=(self.m, self.d))
+        W /= np.linalg.norm(W, axis=1, keepdims=True) + 1e-12
+        self.W = W
+        self.initial_W = W.copy()
+
+        # Symmetric zero-diagonal V
+        self.V = np.zeros((self.m, self.m))
+        # EMA of activities λ_i ≈ E[y_i^2]
+        self.lam = np.full(self.m, 1e-6)
+
+    # ---------- helpers ----------
+
+    def reset(self):
+        """
+        Re-initialize W, V, and λ in the same style as __init__,
+        but keep the RNG state (so repeated calls are not identical).
+        """
+        W = self.rng.normal(size=(self.m, self.d))
+        W /= np.linalg.norm(W, axis=1, keepdims=True) + 1e-12
+        self.W = W
+        self.initial_W = W.copy()
+
+        self.V = np.zeros((self.m, self.m))
+        self.lam = np.full(self.m, 1e-6)
+
+    def _forward(self, X: np.ndarray) -> np.ndarray:
+        """
+        One-shot forward pass:
+
+            Y_ff = X W^T                 # feedforward
+            Y    = Y_ff + Y_ff V^T       # lateral on Y_ff only
+
+        X: (B, d)
+        Returns Y: (B, m)
+        """
+        X = np.asarray(X, dtype=float)
+        # Feedforward drive Y'
+        Y_ff = X @ self.W.T        # (B, m)
+        # One-shot lateral on Y'
+        Y = Y_ff + Y_ff @ self.V.T  # (B, m); V is (m, m)
+        return Y
+
+    def _symmetrize_V(self):
+        self.V = 0.5 * (self.V + self.V.T)
+        np.fill_diagonal(self.V, 0.0)
+
+    def _clip_V_spectral_norm(self):
+        if self.clip_V_spectral is None:
+            return
+        u, s, vt = np.linalg.svd(self.V, full_matrices=False)
+        smax = s[0]
+        if smax > self.clip_V_spectral:
+            s = s * (self.clip_V_spectral / (smax + 1e-12))
+            self.V = (u * s) @ vt
+            if self.symmetrize_V:
+                self._symmetrize_V()
+
+    # ---------- public API ----------
+
+    def step(self, X: np.ndarray):
+        """
+        One learning step on a batch X: shape (B, d).
+
+        Uses:
+          - One-shot forward Y = (I + V) W X
+          - Activity-dependent anti-Hebbian update for V
+          - Hebb–Oja update for W using Y
+        """
+        X = np.asarray(X, dtype=float)
+        B = X.shape[0]
+
+        # Forward pass (one-shot)
+        Y = self._forward(X)  # (B, m)
+
+        # Batch moments
+        y_cov = (Y.T @ Y) / B          # (m, m) ≈ <y y^T>
+        y_var = np.diag(y_cov).copy()  # (m,)   ≈ <y_i^2>
+
+        # EMA of λ_i ≈ E[y_i^2]
+        self.lam = (1.0 - self.ema_alpha) * self.lam + self.ema_alpha * y_var
+
+        # ----- Lateral update: activity-dependent anti-Hebbian -----
+        lam_sum = self.lam[:, None] + self.lam[None, :]  # (m, m)
+        # ΔV_ij = η_v * ( (λ_i + λ_j) * V_ij - C * <y_i y_j> )
+        dV = self.eta_v * (lam_sum * self.V - self.C * y_cov)
+        np.fill_diagonal(dV, 0.0)
+        self.V += dV
+
+        if self.symmetrize_V:
+            self._symmetrize_V()
+        self._clip_V_spectral_norm()
+
+        # ----- Feedforward update: Hebb–Oja on Y -----
+        # Hebbian term <Y X^T>
+        hebb_term = (Y.T @ X) / B      # (m, d)
+        # Oja decay term Diag(<y y^T>) W
+        oja_term = y_var[:, None] * self.W
+        dW = self.eta_w * (hebb_term - oja_term)
+        self.W += dW
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        """
+        Project X onto learned components with the one-shot mapping.
+        """
+        return self._forward(np.asarray(X, dtype=float))
+
+    @property
+    def components_(self) -> np.ndarray:
+        """
+        Rows of W are the learned components. Shape: (m, d)
+
+        Return unit-norm rows for convenience.
+        """
+        W_norm = self.W.copy()
+        W_norm /= np.linalg.norm(W_norm, axis=1, keepdims=True) + 1e-12
+        return W_norm
+
+    @property
+    def initial_weights_(self) -> np.ndarray:
+        """
+        Initial weights W (after last reset). Shape: (m, d)
+        """
+        return self.initial_W
+
+
+class OneShotLeenReislebenPCA:
+    """
+    One-shot variant of the Reisleben (1993) parallel PCA algorithm.
+
+    Architecture:
+    -------------
+    - Input layer:  d = input_dim
+    - Output layer: m = output_dim
+    - Feedforward weights: W ∈ R^{m x d}
+    - Lateral connections: V ∈ R^{m x m}, symmetric, zero diagonal
+
+    One-shot forward mapping:
+    -------------------------
+        Y_ff = W X                (feedforward)
+        Y    = Y_ff + V Y_ff      (lateral on feedforward only)
+
+    In matrix form (for each sample x):
+        y = (I + V) W x
+
+    Learning rules (Reisleben "new proposal", adapted to one-shot Y):
+    ----------------------------------------------------------------
+    1) Lateral update (Eq. 10 style):
+           ΔV = -η_v ( V + <y y^T> )
+       with diagonal forced to zero and optional symmetrization/clipping.
+
+    2) Feedforward update (Eq. 11 style):
+       Define modified output:
+           ỹ = y + C * (V y)        # in matrix form: Y_tilde = Y + C * (Y V^T)
+
+       Then batch updates:
+           y_cov = <y y^T> ≈ (Y^T Y) / B
+           y_var = diag(y_cov)
+
+           hebb_term = < ỹ x^T > ≈ (Y_tilde^T X) / B
+           oja_term  = y_var[:, None] * W
+
+           ΔW = η_w * (hebb_term - oja_term)
+
+    Optional:
+        explicit_W_norm : if True, renormalize each row of W after each step.
+    """
+
+    def __init__(self,
+                 input_dim: int,
+                 output_dim: int,
+                 eta_w: float = 1e-3,
+                 eta_v: float = 5e-3,
+                 C: float = 3.0,
+                 symmetrize_V: bool = True,
+                 settling_steps: int = 1,      # kept for interface compatibility
+                 noise_level: float = 0.0,     # unused in one-shot forward
+                 clip_V_spectral: float | None = 0.95,
+                 explicit_W_norm: bool = False,
+                 seed: int | None = 0):
+        self.d = input_dim
+        self.m = output_dim
+        self.eta_w = eta_w
+        self.eta_v = eta_v
+        self.C = C
+        self.symmetrize_V = symmetrize_V
+        self.settling_steps = settling_steps
+        self.noise_level = noise_level
+        self.clip_V_spectral = clip_V_spectral
+        self.explicit_W_norm = explicit_W_norm
+
+        self.rng = np.random.default_rng(seed)
+
+        # Initialize W: random unit-length rows
+        W = self.rng.normal(size=(self.m, self.d))
+        W /= np.linalg.norm(W, axis=1, keepdims=True) + 1e-12
+        self.W = W
+        self.initial_W = W.copy()
+
+        # Symmetric zero-diagonal V
+        self.V = np.zeros((self.m, self.m), dtype=float)
+
+    # ---------- helpers ----------
+
+    def reset(self):
+        """
+        Reinitialize W and V (same style as __init__), but keep RNG state.
+        """
+        W = self.rng.normal(size=(self.m, self.d))
+        W /= np.linalg.norm(W, axis=1, keepdims=True) + 1e-12
+        self.W = W
+        self.initial_W = W.copy()
+
+        self.V = np.zeros((self.m, self.m), dtype=float)
+
+    def _forward(self, X: np.ndarray) -> np.ndarray:
+        """
+        One-shot forward pass:
+
+            Y_ff = X W^T            # feedforward
+            Y    = Y_ff + Y_ff V^T  # lateral on feedforward only
+
+        X: (B, d)
+        Returns Y: (B, m)
+        """
+        X = np.asarray(X, dtype=float)
+        Y_ff = X @ self.W.T         # (B, m)
+        Y = Y_ff + Y_ff @ self.V.T  # (B, m)
+        return Y
+
+    def _symmetrize_V(self):
+        self.V = 0.5 * (self.V + self.V.T)
+        np.fill_diagonal(self.V, 0.0)
+
+    def _clip_V_spectral_norm(self):
+        if self.clip_V_spectral is None:
+            return
+        u, s, vt = np.linalg.svd(self.V, full_matrices=False)
+        smax = s[0]
+        if smax > self.clip_V_spectral:
+            s = s * (self.clip_V_spectral / (smax + 1e-12))
+            self.V = (u * s) @ vt
+            if self.symmetrize_V:
+                self._symmetrize_V()
+
+    # ---------- public API ----------
+
+    def step(self, X: np.ndarray):
+        """
+        One learning step on a batch X: shape (B, d).
+
+        1) Compute one-shot Y = (I + V) W X.
+        2) Update V with ΔV = -η_v ( V + <y y^T> ).
+        3) Compute modified output Y_tilde = Y + C * (Y V^T).
+        4) Update W with Hebb–Oja using Y_tilde and y_var.
+        """
+        X = np.asarray(X, dtype=float)
+        B = X.shape[0]
+
+        # ----- 1) One-shot forward pass -----
+        Y = self._forward(X)        # (B, m)
+
+        # Batch covariance <y y^T>
+        y_cov = (Y.T @ Y) / B       # (m, m)
+        y_var = np.diag(y_cov).copy()  # (m,)
+
+        # ----- 2) Lateral update (Reisleben eq. 10 style) -----
+        dV = -self.eta_v * (self.V + y_cov)
+        np.fill_diagonal(dV, 0.0)
+        self.V += dV
+
+        if self.symmetrize_V:
+            self._symmetrize_V()
+        self._clip_V_spectral_norm()
+
+        # ----- 3) Modified output: ỹ = y + C * (V y) -----
+        # In batch/matrix form: y_lat = Y V^T, then Y_tilde = Y + C * y_lat
+        y_lat = Y @ self.V.T             # (B, m)
+        Y_tilde = Y + self.C * y_lat     # (B, m)
+
+        # ----- 4) Feedforward update (Hebb–Oja with Y_tilde) -----
+        hebb_term = (Y_tilde.T @ X) / B  # (m, d)
+        oja_term = y_var[:, None] * self.W
+
+        dW = self.eta_w * (hebb_term - oja_term)
+        self.W += dW
+
+        if self.explicit_W_norm:
+            norms = np.linalg.norm(self.W, axis=1, keepdims=True) + 1e-12
+            self.W /= norms
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        """
+        Project X using the one-shot parallel mapping.
+        """
+        return self._forward(np.asarray(X, dtype=float))
+
+    @property
+    def components_(self) -> np.ndarray:
+        """
+        Rows of W are the learned components. Shape: (m, d).
+
+        Return unit-norm rows for convenience.
+        """
+        W_norm = self.W.copy()
+        W_norm /= np.linalg.norm(W_norm, axis=1, keepdims=True) + 1e-12
+        return W_norm
+
+    @property
+    def initial_weights_(self) -> np.ndarray:
+        """
+        Initial W at construction / last reset. Shape: (m, d)
+        """
+        return self.initial_W
