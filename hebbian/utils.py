@@ -456,7 +456,34 @@ def best_match_alignment(W_rows, PC_rows):
 
     return c, C[np.arange(C.shape[0]), c], C
 
-def best_match_align_timeseries(Y, PCs, metric="cov", absolute=True, return_aligned=False):
+
+def best_match_align_eigenvectors(W, V=None, eigenvectors=None):
+    """
+    In the context of Hebbian Network, A can be two conditions:
+        - W = W (the learned components, without any lateral connections)
+        - W = (I + V)W (the learned components, with lateral connections)
+    The mathematical derivation is as follows:
+        - When activation function is linear Hebbian Network, Y = W x, where x is the input data.
+        - When activation function is linear Hebbian Network with lateral connections, Y = (I + V)W x, where x is the input data.
+    eigenvectors is the eigenvectors of the covariance matrix of the data. The eigenvalues are not needed.
+    Returns:
+        perm: indices of eigenvectors assigned to each W row
+        corrs: absolute correlations after optimal assignment
+        C: full |cosine| matrix (m x m)
+    """
+    if V is None:
+        A = W
+    else:
+        A = (np.eye(W.shape[0]) + V) @ W
+    
+    # need to find the best match between the columns of A and the columns of eigenvectors
+    
+
+
+
+
+
+def best_match_align_timeseries(Y, PCs, metric="corr", absolute=True, return_aligned=False):
     """
     Match columns of Y to columns of PCs by maximizing pairwise similarity.
 
@@ -513,8 +540,14 @@ def best_match_align_timeseries(Y, PCs, metric="cov", absolute=True, return_alig
         # Center both Y and PCs
         Yc = _center(Y)
         PCc = _center(PCs)
-        # Cross-covariance matrix: S[i, j] = Cov(Y[:, i], PCs[:, j])
-        S = (Yc.T @ PCc) / (n - 1)
+       # Cross-covariance matrix: S[i, j] = Cov(Y[:, i], PCs[:, j])
+        cov_y_pc = (Yc.T @ PCc) / (n - 1)
+        # Variance of each PC column
+        var_pc = np.sum(PCc ** 2, axis=0) / (n - 1)   # shape (m,)
+
+        # Normalize: divide each column j by Var(PCs[:, j])
+        S = cov_y_pc / var_pc[np.newaxis, :] 
+
     elif metric == "cosine":
         Yn = Y / (np.linalg.norm(Y, axis=0, keepdims=True) + 1e-12)
         PCn = PCs / (np.linalg.norm(PCs, axis=0, keepdims=True) + 1e-12)
