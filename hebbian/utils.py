@@ -460,8 +460,8 @@ def best_match_alignment(W_rows, PC_rows):
 def best_match_align_eigenvectors(W, V=None, eigenvectors=None):
     """
     In the context of Hebbian Network, A can be two conditions:
-        - W = W (the learned components, without any lateral connections)
-        - W = (I + V)W (the learned components, with lateral connections)
+        - A = W x (the learned components, without any lateral connections)
+        - A = (I + V)W x (the learned components, with lateral connections)
     The mathematical derivation is as follows:
         - When activation function is linear Hebbian Network, Y = W x, where x is the input data.
         - When activation function is linear Hebbian Network with lateral connections, Y = (I + V)W x, where x is the input data.
@@ -471,14 +471,58 @@ def best_match_align_eigenvectors(W, V=None, eigenvectors=None):
         corrs: absolute correlations after optimal assignment
         C: full |cosine| matrix (m x m)
     """
+    W = np.asarray(W, dtype=float)
+    
+    # Compute A = W or A = (I + V) @ W
     if V is None:
         A = W
     else:
+        V = np.asarray(V, dtype=float)
         A = (np.eye(W.shape[0]) + V) @ W
-    
-    # need to find the best match between the columns of A and the columns of eigenvectors
-    
 
+    
+    eigenvectors = np.asarray(eigenvectors, dtype=float)
+    
+    # Normalize rows of A (each row is a weight vector)
+    A_norm = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-12)
+    
+    # Normalize columns of eigenvectors (each column is an eigenvector)
+    eig_norm = eigenvectors / (np.linalg.norm(eigenvectors, axis=0, keepdims=True) + 1e-12)
+    
+    # Compute cosine similarity matrix: C[i, j] = |cos(θ)| between A[i, :] and eigenvectors[:, j]
+    C = np.abs(A_norm @ eig_norm)  # shape (m, k) where k is number of eigenvectors
+    
+    # Use Hungarian algorithm to find optimal matching
+    # Convert similarity to cost: cost = 1 - similarity
+    m, k = C.shape
+    # If we have more weight vectors than eigenvectors, pad with zeros
+    # If we have more eigenvectors than weight vectors, we'll match to the first m
+    if m > k:
+        # Pad C with zeros (no match possible for extra rows)
+        C_padded = np.zeros((m, m))
+        C_padded[:, :k] = C
+        C_use = C_padded
+    elif k > m:
+        # Only use first m eigenvectors
+        C_use = C[:, :m]
+    else:
+        C_use = C
+    
+    # Hungarian algorithm: minimize cost = 1 - similarity
+    row_ind, col_ind = linear_sum_assignment(1.0 - C_use)
+    
+    # Build permutation array
+    perm = np.empty(m, dtype=int)
+    perm[row_ind] = col_ind
+    
+    # Get the actual similarities for the matched pairs
+    # Handle case where we might have matched to padded columns
+    corrs = np.zeros(m)
+    for i in range(m):
+        if perm[i] < k:  # Only if matched to a real eigenvector
+            corrs[i] = C[i, perm[i]]
+    
+    return perm, corrs, C
 
 
 
@@ -795,13 +839,20 @@ def Y_aligned_training_testing_online(model, X, batch_size=1, alignment = "cov",
     similarity_list = []
     # get true PC scores
     PC_scores = get_pc_scores(X, true_pcs_rows(X), m=model.m)
+    # get the eigenvectors of the covariance matrix of the data
+    _, eigenvectors = compute_eigen_decomposition(X, center_data=True)
     # print(f'W: {model.W}; V: {model.V}')
     for step in range(0, number_of_samples, batch_size):
         X_train = X[step:step+batch_size]
         model.step(X_train)
         # use the X_mask to incrementally reveal the input matrix, and update the model
         Y_output = model.transform(X)
-        order, similarity, _, _ = best_match_align_timeseries(Y_output, PC_scores[:,:model.m], metric=alignment)
+        try:
+            V = model.V
+        except AttributeError:
+            V = None
+        order, similarity, _ = best_match_align_eigenvectors(model.W, V, eigenvectors[:,:model.m])
+        # order, similarity, _, _ = best_match_align_timeseries(Y_output, PC_scores[:,:model.m], metric=alignment)
         if step % 1000 == 0:
             print(f"step {step:4d} | order = {order} | best|corr|= {np.round(similarity,3)}")
         # based on the order, sort the similarity to match PC order
