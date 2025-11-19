@@ -743,10 +743,10 @@ class OneShotLeenReislebenPCA:
            ỹ = y + C * (V y)        # in matrix form: Y_tilde = Y + C * (Y V^T)
 
        Then batch updates:
-           y_cov = <y y^T> ≈ (Y^T Y) / B
+           y_cov = <y y^T> ≈ (Y^T Y) / n_samples
            y_var = diag(y_cov)
 
-           hebb_term = < ỹ x^T > ≈ (Y_tilde^T X) / B
+           hebb_term = < ỹ x^T > ≈ (Y_tilde^T X) / n_samples
            oja_term  = y_var[:, None] * W
 
            ΔW = η_w * (hebb_term - oja_term)
@@ -809,12 +809,12 @@ class OneShotLeenReislebenPCA:
             Y_ff = X W^T            # feedforward
             Y    = Y_ff + Y_ff V^T  # lateral on feedforward only
 
-        X: (B, d)
-        Returns Y: (B, m)
+        X: (n_samples, d)
+        Returns Y: (n_samples, m)
         """
         X = np.asarray(X, dtype=float)
-        Y_ff = X @ self.W.T         # (B, m)
-        Y = Y_ff + Y_ff @ self.V.T  # (B, m)
+        Y_ff = X @ self.W.T         # (n_samples, m)
+        Y = Y_ff + Y_ff @ self.V.T  # (n_samples, m)
         return Y
 
     def _symmetrize_V(self):
@@ -836,7 +836,7 @@ class OneShotLeenReislebenPCA:
 
     def step(self, X: np.ndarray):
         """
-        One learning step on a batch X: shape (B, d).
+        One learning step on a batch X: shape (n_samples, d).
 
         1) Compute one-shot Y = (I + V) W X.
         2) Update V with ΔV = -η_v ( V + <y y^T> ).
@@ -844,13 +844,13 @@ class OneShotLeenReislebenPCA:
         4) Update W with Hebb–Oja using Y_tilde and y_var.
         """
         X = np.asarray(X, dtype=float)
-        B = X.shape[0]
+        n_samples = X.shape[0]
 
         # ----- 1) One-shot forward pass -----
-        Y = self._forward(X)        # (B, m)
+        Y = self._forward(X)        # (n_samples, m)
 
         # Batch covariance <y y^T>
-        y_cov = (Y.T @ Y) / B       # (m, m)
+        y_cov = (Y.T @ Y) / n_samples       # (m, m)
         y_var = np.diag(y_cov).copy()  # (m,)
 
         # ----- 2) Lateral update (Reisleben eq. 10 style) -----
@@ -864,11 +864,11 @@ class OneShotLeenReislebenPCA:
 
         # ----- 3) Modified output: ỹ = y + C * (V y) -----
         # In batch/matrix form: y_lat = Y V^T, then Y_tilde = Y + C * y_lat
-        y_lat = Y @ self.V.T             # (B, m)
-        Y_tilde = Y + self.C * y_lat     # (B, m)
+        y_lat = Y @ self.V.T             # (n_samples, m)
+        Y_tilde = Y + self.C * y_lat     # (n_samples, m)
 
         # ----- 4) Feedforward update (Hebb–Oja with Y_tilde) -----
-        hebb_term = (Y_tilde.T @ X) / B  # (m, d)
+        hebb_term = (Y_tilde.T @ X) / n_samples  # (m, d)
         oja_term = y_var[:, None] * self.W
 
         dW = self.eta_w * (hebb_term - oja_term)
