@@ -690,103 +690,18 @@ def compute_eigen_decomposition(X, center_data=True, return_covariance=False):
 
 # ------ Data generation helpers ------
 
-def generate_covariance_matrix(dim, method='random', eigenvalues=None, condition_number=None, seed=None):
-    """
-    Generate a symmetric positive-semidefinite covariance matrix.
+def generate_covariance_matrix(dim, eigenvalues, method="eigenvalues"):
+    # Create the diagonal matrix
+    D = np.diag(eigenvalues)
     
-    Parameters
-    ----------
-    dim : int
-        Dimension of the covariance matrix (dim x dim)
-    method : str, default='random'
-        Method to generate the matrix:
-        - 'random': Random positive definite matrix
-        - 'eigenvalues': Use specified eigenvalues
-        - 'condition': Use specified condition number
-        - 'toeplitz': Toeplitz matrix (correlation decreases with distance)
-        - 'block': Block diagonal structure
-    eigenvalues : array-like, optional
-        Specific eigenvalues to use (must be non-negative)
-    condition_number : float, optional
-        Condition number (max_eigenval / min_eigenval) for 'condition' method
-    seed : int, optional
-        Random seed for reproducibility
-        
-    Returns
-    -------
-    cov : ndarray, shape (dim, dim)
-        Symmetric positive-semidefinite covariance matrix
-    """
-    if seed is not None:
-        np.random.seed(seed)
+    # Generate random rotation Q
+    Q, _ = np.linalg.qr(np.random.randn(dim, dim))
     
-    if method == 'random':
-        # Method 1: Random positive definite matrix
-        A = np.random.randn(dim, dim)
-        cov = A @ A.T  # This ensures positive semidefinite
-        # Add diagonal to ensure positive definite
-        cov += np.eye(dim) * 0.1
-        
-    elif method == 'eigenvalues':
-        # Method 2: Use specified eigenvalues
-        if eigenvalues is None:
-            eigenvalues = np.linspace(1.0, 0.1, dim)
-        eigenvalues = np.asarray(eigenvalues)
-        assert len(eigenvalues) == dim, "Eigenvalues length must match dimension"
-        assert np.all(eigenvalues >= 0), "All eigenvalues must be non-negative"
-        
-        # Generate random orthogonal matrix
-        Q, _ = np.linalg.qr(np.random.randn(dim, dim))
-        cov = Q @ np.diag(eigenvalues) @ Q.T
-        
-    elif method == 'condition':
-        # Method 3: Use specified condition number
-        if condition_number is None:
-            condition_number = 10.0
-        assert condition_number >= 1.0, "Condition number must be >= 1"
-        
-        # Generate eigenvalues with specified condition number
-        max_eigenval = 1.0
-        min_eigenval = max_eigenval / condition_number
-        eigenvalues = np.linspace(max_eigenval, min_eigenval, dim)
-        
-        # Generate random orthogonal matrix
-        Q, _ = np.linalg.qr(np.random.randn(dim, dim))
-        cov = Q @ np.diag(eigenvalues) @ Q.T
-        
-    elif method == 'toeplitz':
-        # Method 4: Toeplitz matrix (correlation structure)
-        rho = 0.7  # correlation parameter
-        cov = np.zeros((dim, dim))
-        for i in range(dim):
-            for j in range(dim):
-                cov[i, j] = rho ** abs(i - j)
-        # Scale to have unit diagonal
-        cov = cov / np.diag(cov)[:, None]
-        
-    elif method == 'block':
-        # Method 5: Block diagonal structure
-        block_size = min(3, dim)
-        cov = np.zeros((dim, dim))
-        
-        for i in range(0, dim, block_size):
-            end_idx = min(i + block_size, dim)
-            block_dim = end_idx - i
-            if block_dim > 1:
-                # Create a small positive definite block
-                A = np.random.randn(block_dim, block_dim)
-                block = A @ A.T + np.eye(block_dim) * 0.1
-                cov[i:end_idx, i:end_idx] = block
-            else:
-                cov[i, i] = 1.0
-                
-    else:
-        raise ValueError(f"Unknown method: {method}")
+    # Reconstruct full matrix
+    _Sigma = Q @ D @ Q.T
+    Sigma = 0.5 * (_Sigma + _Sigma.T)
     
-    # Ensure symmetry (should already be symmetric, but just in case)
-    cov = (cov + cov.T) / 2
-    
-    return cov
+    return Sigma  # Must return (dim, dim) array
 
 def generate_samples(d, number_of_samples):
     mu = np.full(d, 0.0)
@@ -907,89 +822,6 @@ def averaged_training_testing_W(model, model_paras, X, runs = 10, batch_size=100
 
 
 # --- helpers (same as before) ---
-
-def rotation_matrix_nd(d: int, axis1: int, axis2: int, phi_rad: float) -> np.ndarray:
-    """
-    Generate a rotation matrix in d-dimensional space that rotates in the plane
-    spanned by axis1 and axis2.
-    
-    Parameters
-    ----------
-    d : int
-        Dimension of the space
-    axis1 : int
-        First axis of the rotation plane (0-indexed)
-    axis2 : int
-        Second axis of the rotation plane (0-indexed)
-    phi_rad : float
-        Rotation angle in radians
-        
-    Returns
-    -------
-    R : ndarray, shape (d, d)
-        Rotation matrix
-    """
-    if axis1 == axis2:
-        raise ValueError("axis1 and axis2 must be different")
-    if not (0 <= axis1 < d and 0 <= axis2 < d):
-        raise ValueError(f"axes must be in [0, {d-1}]")
-    
-    R = np.eye(d)
-    c, s = np.cos(phi_rad), np.sin(phi_rad)
-    
-    # Set the 2x2 rotation block in the plane
-    R[axis1, axis1] = c
-    R[axis1, axis2] = -s
-    R[axis2, axis1] = s
-    R[axis2, axis2] = c
-    
-    return R
-
-
-def rotate_cov_nd(Sigma: np.ndarray, phi_rad: float, axis1: int = 0, axis2: int = 1, 
-                  rotation_matrix: np.ndarray = None) -> np.ndarray:
-    """
-    Rotate a covariance matrix in n-dimensional space.
-    
-    Parameters
-    ----------
-    Sigma : ndarray, shape (d, d)
-        Covariance matrix to rotate
-    phi_rad : float
-        Rotation angle in radians (ignored if rotation_matrix is provided)
-    axis1 : int, default=0
-        First axis of the rotation plane (ignored if rotation_matrix is provided)
-    axis2 : int, default=1
-        Second axis of the rotation plane (ignored if rotation_matrix is provided)
-    rotation_matrix : ndarray, shape (d, d), optional
-        If provided, use this rotation matrix directly. Overrides axis1, axis2, phi_rad.
-        
-    Returns
-    -------
-    Sigma_rot : ndarray, shape (d, d)
-        Rotated covariance matrix (symmetric)
-    """
-    Sigma = np.asarray(Sigma, dtype=float)
-    d = Sigma.shape[0]
-    
-    if Sigma.shape != (d, d):
-        raise ValueError(f"Sigma must be square, got shape {Sigma.shape}")
-    
-    # Use provided rotation matrix or generate one
-    if rotation_matrix is not None:
-        R = np.asarray(rotation_matrix, dtype=float)
-        if R.shape != (d, d):
-            raise ValueError(f"rotation_matrix must be ({d}, {d}), got {R.shape}")
-    else:
-        R = rotation_matrix_nd(d, axis1, axis2, phi_rad)
-    
-    # Rotate: R @ Sigma @ R.T
-    Srot = R @ Sigma @ R.T
-    
-    # Ensure symmetry (numerical stability)
-    return 0.5 * (Srot + Srot.T)
-
-
 def eig_sorted(Sigma: np.ndarray):
     w, V = np.linalg.eigh(Sigma)
     idx = np.argsort(w)[::-1]
@@ -1023,63 +855,61 @@ def _plot_eigenvectors(ax, Sigma, color, label_prefix, alpha=0.95):
     return proxies
 
 
-def instantiate_before_after_X(Sigma, Sigma_rot, N = 2, seed: int = 0, n_samples: int = 600):
+# 1. The Rotation Matrix Generator
+def rotation_matrix_nd(d: int, axis1: int, axis2: int, phi_rad: float) -> np.ndarray:
+    R = np.eye(d)
+    c, s = np.cos(phi_rad), np.sin(phi_rad)
+    R[axis1, axis1] = c
+    R[axis1, axis2] = -s
+    R[axis2, axis1] = s
+    R[axis2, axis2] = c
+    return R
+
+
+def instantiate_rotated_data(N, m, Sigma_m, phi_rad=0, seed=0, n_samples=10001):
+    """
+    Generate N-dimensional data from m-dimensional covariance matrix.
+    The data will have only m effective PCs even though it's in N dimensions.
+    
+    Parameters:
+    -----------
+    N : int
+        Output dimension (number of neurons, e.g., 64)
+    m : int
+        Intrinsic dimension (number of PCs, e.g., 4)
+    eigenvalues : array-like, shape (m,)
+        Eigenvalues for the m×m covariance matrix
+    phi_rad : float
+        Rotation angle in radians (for generating X_after)
+    seed : int
+        Random seed
+    n_samples : int
+        Number of samples to generate
+        
+    Returns:
+    --------
+    X_before : ndarray, shape (n_samples, N)
+        Data in N dimensions with m effective PCs
+    X_after : ndarray, shape (n_samples, N)
+        Rotated data in N dimensions with m effective PCs
+    """
     rng = np.random.default_rng(seed)
-    # shape of Sigma is (d, d)
-    d = np.shape(Sigma)[0]
-    _before = rng.multivariate_normal(np.zeros(d), Sigma, size=n_samples)
-    _after  = rng.multivariate_normal(np.zeros(d), Sigma_rot, size=n_samples)
-    if d == N:
-        X_before = _before
-        X_after  = _after
-        return X_before, X_after
-    elif N > d:
-        # use rng to generate a random matrix Q
-        Q, _ = np.linalg.qr(rng.standard_normal((N, d)))
-        A = Q[:, :d]
-        # generate N-d data by projecting d-d data onto an N-d space
-        X_before = _before @ A.T
-        X_after  = _after @ A.T
-        return X_before, X_after
-    else:
-        raise ValueError(f"Sigma has {d} dimensions, expected {N}")
 
-# --- one-figure comparison with BOTH eigenvectors ---
-def before_after_distribution(Sigma, Sigma_rot, phi_deg: float, N: int = 2, seed: int = 0,
-                                       n_samples: int = 600, show_samples: bool = True):
-    X_before, X_after = instantiate_before_after_X(Sigma, Sigma_rot, N=N, seed=seed, n_samples=n_samples)
-
-    # ex1, ey1 = ellipse_xy_from_cov(Sigma, n_std=2.0)
-    # ex2, ey2 = ellipse_xy_from_cov(Sigma_rot, n_std=2.0)
-
-
-    # scatter samples (optional)
-    if show_samples:
-        fig, ax = plt.subplots(figsize=(7, 6))
-        ax.scatter(X_before[:,0], X_before[:,1], s=8, alpha=0.25, color="tab:blue",  label="samples (before)")
-        ax.scatter(X_after[:,0],  X_after[:,1],  s=8, alpha=0.25, color="tab:orange", label="samples (after)")
-
-    # 2σ ellipses
-    # l1, = ax.plot(ex1, ey1, lw=2.2, color="tab:blue",  label="ellipse 2σ (before)")
-    # l2, = ax.plot(ex2, ey2, lw=2.2, color="tab:orange", label=f"ellipse 2σ (after, φ={phi_deg}°)")
-
-    # BOTH eigenvectors for each covariance
-    proxies_b = _plot_eigenvectors(ax, Sigma,     color="tab:blue",  label_prefix="before")
-    proxies_a = _plot_eigenvectors(ax, Sigma_rot, color="tab:orange", label_prefix="after")
-
-    # assemble legend
-    legend_items = []
-    if show_samples:
-        legend_items += [Line2D([0],[0], marker='o', linestyle='None', color="tab:blue",  alpha=0.25, label="samples (before)"),
-                         Line2D([0],[0], marker='o', linestyle='None', color="tab:orange", alpha=0.25, label="samples (after)")]
-    # legend_items += [l1, l2] + proxies_b + proxies_a
-    ax.legend(handles=legend_items, loc="best")
-
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_title("Before vs After rotation — both eigenvectors per covariance")
-    ax.set_xlabel("x1"); ax.set_ylabel("x2")
-    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
-    fig.tight_layout()
-    plt.show()
+    # Step 2: Generate data in m-dimensional space
+    Z_before = rng.multivariate_normal(np.zeros(m), Sigma_m, size=n_samples)
+    
+    # Step 3: Rotate in m-dimensional space (for X_after)
+    R_m = rotation_matrix_nd(m, axis1=0, axis2=1, phi_rad=phi_rad)
+    Z_after = Z_before @ R_m.T
+    
+    # Step 4: Project from m dimensions to N dimensions
+    # Generate a random orthogonal projection matrix
+    # This ensures the data in N dimensions only has m effective PCs
+    Q, _ = np.linalg.qr(rng.standard_normal((N, m)))
+    A = Q[:, :m]  # (N, m) projection matrix
+    
+    # Project to N dimensions
+    X_before = Z_before @ A.T  # (n_samples, m) @ (m, N) = (n_samples, N)
+    X_after = Z_after @ A.T    # (n_samples, m) @ (m, N) = (n_samples, N)
+    
     return X_before, X_after
-
