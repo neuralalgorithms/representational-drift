@@ -484,7 +484,8 @@ class LeenCompletePCA:
 
     def step(self, X: np.ndarray):
         """
-        One learning step on a batch X: shape (B, d).
+        One learning step on a batch X: shape (T, d).
+
         """
         X = np.asarray(X, dtype=float)
         T = X.shape[0]
@@ -843,13 +844,13 @@ class OneShotLeenFreislebenPCA:
         4) Update W with Hebb–Oja using Y_tilde and y_var.
         """
         X = np.asarray(X, dtype=float)
-        n_samples = X.shape[0]
+        T = X.shape[0]
 
         # ----- 1) One-shot forward pass -----
         Y = self._forward(X)        # (n_samples, output_size)
 
         # Batch covariance <y y^T>
-        y_cov = (Y.T @ Y) / n_samples       # (output_size, output_size)
+        y_cov = (Y.T @ Y) / T       # (output_size, output_size)
         y_var = np.diag(y_cov).copy()  # (output_size,)
 
         # ----- 2) Lateral update (Reisleben eq. 10 style) -----
@@ -863,11 +864,11 @@ class OneShotLeenFreislebenPCA:
 
         # ----- 3) Modified output: ỹ = y + C * (V y) -----
         # In batch/matrix form: y_lat = Y V^T, then Y_tilde = Y + C * y_lat
-        y_lat = Y @ self.V.T             # (n_samples, output_size)
-        Y_tilde = Y + self.C * y_lat     # (n_samples, output_size)
+        y_lat = Y @ self.V.T             # (T, output_size)
+        Y_tilde = Y + self.C * y_lat     # (T, output_size)
 
         # ----- 4) Feedforward update (Hebb–Oja with Y_tilde) -----
-        hebb_term = (Y_tilde.T @ X) / n_samples  # (output_size, input_size)
+        hebb_term = (Y_tilde.T @ X) / T  # (output_size, input_size)
         oja_term = y_var[:, None] * self.W # (output_size, input_size)
 
         dW = self.eta_w * (hebb_term - oja_term)
@@ -878,17 +879,6 @@ class OneShotLeenFreislebenPCA:
         Project X using the one-shot parallel mapping.
         """
         return self._forward(np.asarray(X, dtype=float))
-
-    @property
-    def components_(self) -> np.ndarray:
-        """
-        Rows of W are the learned components. Shape: (output_size, input_size).
-
-        Return unit-norm rows for convenience.
-        """
-        W_norm = self.W.copy()
-        W_norm /= np.linalg.norm(W_norm, axis=1, keepdims=True) + 1e-12
-        return W_norm
 
     @property
     def initial_weights_(self) -> np.ndarray:
@@ -1066,4 +1056,142 @@ class LeenCompletePCA_TD:
     @property
     def initial_weights_(self) -> np.ndarray:
         "Initial weights W, make sure the model is re-initialized. Shape: (output_size, input_size)"
+        return self.initial_W
+
+
+
+class FoldiakPCA:
+    """
+    A two-layer network with a Hebbian layer and an Anti-Hebbian layer.
+    """
+
+    def __init__(self,
+                 input_size: int,
+                 output_size: int,
+                 eta_w: float = 1e-3,
+                 eta_v: float = 5e-3,
+                 symmetrize_V: bool = True,
+                 clip_V_spectral: float | None = 0.95,
+                 seed: int | None = 0):
+        self.input_size = input_size
+        self.output_size = output_size
+        self.eta_w = eta_w
+        self.eta_v = eta_v
+        self.symmetrize_V = symmetrize_V
+        self.clip_V_spectral = clip_V_spectral
+
+        self.rng = np.random.default_rng(seed)
+
+        # Initialize W: random unit-length rows
+        W = self.rng.normal(size=(self.output_size, self.input_size))
+        W /= np.linalg.norm(W, axis=1, keepdims=True) + 1e-12
+        self.W = W
+        self.initial_W = W.copy()
+
+        # Symmetric zero-diagonal V
+        self.V = np.zeros((self.output_size, self.output_size), dtype=float)
+
+    # ---------- helpers ----------
+
+    def reset(self):
+        """
+        Reinitialize W and V (same style as __init__), but keep RNG state.
+        """
+        W = self.rng.normal(size=(self.output_size, self.input_size))
+        W /= np.linalg.norm(W, axis=1, keepdims=True) + 1e-12
+        self.W = W
+        self.initial_W = W.copy()
+
+        self.V = np.zeros((self.output_size, self.output_size), dtype=float)
+
+    def _forward(self, X: np.ndarray) -> np.ndarray:
+        """
+        One-shot forward pass:
+
+            Y_ff = X W^T            # feedforward
+            Y    = Y_ff + Y_ff V^T  # lateral on feedforward only
+
+        X: (n_samples, d)
+        Returns Y: (n_samples, output_size)
+        """
+        X = np.asarray(X, dtype=float)
+        Y_ff = X @ self.W.T         # (n_samples, output_size)
+        Y = Y_ff + Y_ff @ self.V.T  # (n_samples, output_size)
+        return Y
+
+    def _symmetrize_V(self):
+        self.V = 0.5 * (self.V + self.V.T)
+        np.fill_diagonal(self.V, 0.0)
+
+    def _clip_V_spectral_norm(self):
+        if self.clip_V_spectral is None:
+            return
+        u, s, vt = np.linalg.svd(self.V, full_matrices=False)
+        smax = s[0]
+        if smax > self.clip_V_spectral:
+            s = s * (self.clip_V_spectral / (smax + 1e-12))
+            self.V = (u * s) @ vt
+            if self.symmetrize_V:
+                self._symmetrize_V()
+
+    # ---------- public API ----------
+
+    def step(self, X: np.ndarray):
+        """
+        One learning step on a batch X: shape (B, d).
+
+        Uses:
+          - One-shot forward Y = (I + V) W X
+          - Activity-dependent anti-Hebbian update for V
+          - Hebb–Oja update for W using Y
+        """
+        X = np.asarray(X, dtype=float)
+        T = X.shape[0]
+
+        # Forward pass (one-shot)
+        Y = self._forward(X)  # (B, m)
+
+        # Batch moments
+        y_cov = (Y.T @ Y) / T          # (output_size, output_size) ≈ <y y^T>
+        y_var = np.diag(y_cov).copy()  # (m,)   ≈ <y_i^2>
+
+        # ----- Lateral update: activity-dependent anti-Hebbian -----
+        dV = self.eta_v * (- y_cov)
+        np.fill_diagonal(dV, 0.0)
+        self.V += dV
+
+        if self.symmetrize_V:
+            self._symmetrize_V()
+        self._clip_V_spectral_norm()
+
+        # ----- Feedforward update: Hebb–Oja on Y -----
+        # Hebbian term <Y X^T>
+        hebb_term = (Y.T @ X) / T      # (output_size, input_size)
+        # Oja decay term Diag(<y y^T>) W
+        oja_term = y_var[:, None] * self.W
+        dW = self.eta_w * (hebb_term - oja_term)
+        self.W += dW
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        """
+        Project X using the one-shot parallel mapping.
+        """
+        return self._forward(np.asarray(X, dtype=float))
+
+    @property
+    def components_(self) -> np.ndarray:
+        """
+        Rows of W are the learned components. Shape: (output_size, input_size).
+
+        Return unit-norm rows for convenience.
+        """
+        W_norm = self.W.copy()
+        W_norm /= np.linalg.norm(W_norm, axis=1, keepdims=True) + 1e-12
+        return W_norm
+
+    @property
+    def initial_weights_(self) -> np.ndarray:
+        """
+        Initial W at construction / last reset. Shape: (output_size, input_size)
+        """
         return self.initial_W
