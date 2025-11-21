@@ -71,128 +71,37 @@ def correlation_alignment(u, v):
     r, _ = pearsonr(u, v)
     return float(abs(r))
 
-# the main function to train and test the models
-def training_testing(
-    samples,
-    models=None,                 # list/dict of model classes or instances
-    output_size=None,
-    alignment_method="weights",
-    pc_method="ordered",
-    show_num=None
-):
-    """
-    Run training/testing over one or more models and visualize alignment per model.
+def bar_graph_with_error_bars(df_best_corr, title):
+    figure = plt.figure()
+    means = df_best_corr.mean(axis=0)
+    stds = df_best_corr.std(axis=0)
+    plt.figure(figsize=(10, 6))
+    plt.bar(means.index, means.values, yerr=stds.values, capsize=5)
+    plt.ylabel('Mean Absolute Correlation')
+    plt.title(title)
+    plt.show()
 
-    Parameters
-    ----------
-    samples : np.ndarray
-        Data matrix of shape (n_samples, n_features).
-    models : list | dict
-        - If list: [ModelClassA, ModelClassB] or [("Label A", ModelClassA), instanceB, ...]
-        - If dict: {"Label A": ModelClassA, "Label B": instanceB}
-        Each element can be:
-          * a callable/class (will be instantiated with input_size, output_size, learning_rate), or
-          * a pre-instantiated model object that exposes `.weights` and works with `testing_alignment`.
-    output_size : int | None
-        Number of output units per model. Defaults to samples_dim if None.
-    learning_rate : float
-    epochs : int
-    method : {"epochs", ...}
-        Passed through to `testing_alignment`.
-    pc_method : {"first", "ordered"}
-        How to build the PC target set.
-    show_num : int | None
-        How many neurons to visualize per model (defaults to `output_size`).
+def training_testing(model, data, m, runs =10, graph = True, alignment = "eigenvectors"):
+    df_best_corr = pd.DataFrame(data=np.full((runs, m), np.nan), 
+                            columns=[f"PC_{i+1}" for i in range(m)],
+                            index=[f"run_{i+1}" for i in range(runs)])
+    for run in range(runs):
+        print(f"run {run+1:2d}")
+        model.reset()
+        order, similarity = Y_aligned_training_testing_online(model, X=data, graph=True, alignment=alignment)
+        # print(f"After first phase: model.W = {model.W}, model.V: {model.V}")
 
-    Returns
-    -------
-    histories_by_model : dict[str, np.ndarray]
-        {label: history_array_of_shape_(T, output_size)}
-    weights_by_model : dict[str, np.ndarray]
-        {label: final_weights_matrix}
-    """
+        # print(f"Y_output_after_first_phase: {model.transform(data_before)}")
+       # based on the order, sort the similarity to match PC order
+        combined_lists = zip(order, similarity)
+        # Sort the pairs based on PC_orders
+        sorted_combined_lists = sorted(combined_lists)
+        # Unzip the sorted pairs
+        _, ordered_similarity = zip(*sorted_combined_lists)
+        df_best_corr.iloc[run, :] = ordered_similarity 
 
-    if models is None:
-        raise ValueError("Please provide `models` as a list or dict of models.")
-
-    samples_dim = samples.shape[1]
-    output_size = output_size or samples_dim
-
-
-
-    # Normalize `models` into (label, obj_or_class) list
-    def _label_for(m):
-        if isinstance(m, tuple) and len(m) == 2:
-            return str(m[0])
-        if callable(m):
-            return getattr(m, "__name__", "Model")
-        return m.__class__.__name__
-
-    if isinstance(models, dict):
-        items = list(models.items())  # (label, model)
-    elif isinstance(models, (list, tuple)):
-        items = []
-        for m in models:
-            if isinstance(m, tuple) and len(m) == 2:
-                items.append((str(m[0]), m[1]))
-            else:
-                items.append((_label_for(m), m))
-    else:
-        raise ValueError("`models` must be a list/tuple or dict.")
-
-    histories_by_model = {}
-
-    # PCs
-    pcs, _, pc_scores = pca_topk(samples, samples_dim, center=True)
-    if pc_method == "first":
-        pc_set = [pcs[:, 0] for _ in range(samples_dim)]
-        pc_scores_set = [pc_scores[:, 0] for _ in range(samples_dim)]
-    elif pc_method == "ordered":
-        pc_set = [pcs[:, i] for i in range(samples_dim)]
-        pc_scores_set = [pc_scores[:, i] for i in range(samples_dim)]
-    else:
-        raise ValueError("pc_method must be 'first' or 'ordered'.")
-    # Decide which PCs to pass based on output_size vs samples_dim
-    pcs_for_eval = pc_set[:samples_dim] if output_size > samples_dim else pc_set
-    pcs_scores_for_eval = pc_scores_set[:samples_dim] if output_size > samples_dim else pc_scores_set
-
-    
-    # Iterate over models
-    for label, m in items:
-        model_obj = m
-        hist = []
-        y_hist = []
-        if alignment_method == "weights":
-            for i in range(samples.shape[0]):
-                model_obj.step(samples[i])
-                Amat = model_obj.get_effective_weights()
-                hist.append([cosine_alignment(Amat[i, :], pcs_for_eval[i]) for i in range(min(Amat.shape[0], len(pcs_for_eval)))])
-
-        elif alignment_method == "activity":
-            for i in range(samples.shape[0]):
-                yi = model_obj.step(samples[i])
-                y_hist.append(yi)
-                len_y_hist = len(y_hist)
-                if len_y_hist > 2:
-                    hist.append([correlation_alignment(np.array(y_hist)[:,i], np.array(pcs_scores_for_eval)[i,:len_y_hist]) for i in range(min(np.array(y_hist).shape[0], len(pcs_scores_for_eval)))])
-        else:
-            raise ValueError("alignment_method must be 'weights' or 'activity'.")
-
-        histories_by_model[label] = np.array(hist)
-
-        # Visualization: one figure per model, lines = neurons
-        # (Matches your previous pattern of 1 plot per model.)
-        sn = show_num if show_num is not None else output_size
-        sn = min(sn, histories_by_model[label].shape[1])
-        display_dict = {
-            f"{label} (neuron {i+1})": histories_by_model[label][:, i] for i in range(sn)
-        }
-        visualize_alignment(
-            list(display_dict.values()),
-            list(display_dict.keys()),
-            input_size=samples_dim,
-            xlabel="trials",
-        )
+    if graph == True:
+        bar_graph_with_error_bars(df_best_corr, "Mean Absolute Correlation (before)")
 
 # to test the eigenvalue
 def estimate_output_variances(X, weights, center=True, unit_weights=True):
@@ -211,24 +120,6 @@ def estimate_output_variances(X, weights, center=True, unit_weights=True):
 
     Y = W@X.T                   # (k, n) x (n, samples)
     return Y.var(axis=1, ddof=1)
-
-#--------------------------------
-# Data simulation functions
-#--------------------------------
-
-def gauss_distrib(theta, mu1, std1, mu2, std2, number_of_samples, number_of_neurons=2):
-    samples = np.zeros((number_of_samples, number_of_neurons));
-    for i in range(number_of_samples):
-        u1 = np.random.random();
-        u2 = np.random.random();
-        T1 = np.sqrt(-2 * np.log(u1)) * np.cos(2*np.pi*u2);
-        T2 = np.sqrt(-2 * np.log(u1)) * np.sin(2*np.pi*u2);
-        
-        samples[i,0] = mu1 +  (std1*T1 * np.cos(theta) - std2*T2 * np.sin(theta));
-        samples[i,1] = mu2 +  (std1*T1 * np.sin(theta) + std2*T2 * np.cos(theta));	
-    samples[:,0] -= np.mean(samples[:,0])
-    samples[:,1] -=np.mean(samples[:,1])
-    return samples
 
 #--------------------------------
 # Visualization functions
@@ -436,25 +327,6 @@ def plot_samples_and_top3_pcs_3d(X, center=True, scale=2.5, annotate=True, ax=No
 
 
 # --- PCA alignment helpers ---
-def best_match_alignment(W_rows, PC_rows):
-    """
-    W_rows: (m, d) learned components, row-normalized
-    PC_rows: (m, d) true PCs, row-normalized in descending variance order
-    Returns:
-      perm: indices of PCs assigned to each W row
-      corrs: absolute correlations after optimal assignment
-      C: full |cosine| matrix (m x m)
-    """
-    # normalize
-    Wn = W_rows / (np.linalg.norm(W_rows, axis=1, keepdims=True) + 1e-12)
-    PCn = PC_rows / (np.linalg.norm(PC_rows, axis=1, keepdims=True) + 1e-12)
-    # cosine matrix
-    C = np.abs(Wn @ PCn.T)
-
-        # Hungarian solves a min-cost problem; convert to cost = 1 - C
-    r, c = linear_sum_assignment(1.0 - C)
-
-    return c, C[np.arange(C.shape[0]), c], C
 
 
 def best_match_align_eigenvectors(W, V=None, eigenvectors=None):
@@ -618,20 +490,6 @@ def best_match_align_timeseries(Y, PCs, metric="corr", absolute=True, return_ali
     return perm, sims, S, signs
 
 
-def true_pcs_rows(X):
-    """Return top-m PCs as ROWS (shape m x d)."""
-    Xc = X - X.mean(axis=0, keepdims=True)
-    U, S, VT = np.linalg.svd(Xc, full_matrices=False)
-    return VT  # rows are PCs
-
-def get_pc_scores(X, eigenvectors, m=None):
-    Xc = X - X.mean(axis=0, keepdims=True)
-    PC_scores = Xc @ eigenvectors
-    if m is not None:
-        PC_scores = PC_scores[:, :m]
-    return PC_scores
-
-
 def subspace_max_angle_deg(W_rows, PC_rows):
     """Largest principal angle between the two m-dim subspaces (in degrees)."""
     # Orthonormal bases for colspaces of W^T and PC^T
@@ -688,27 +546,6 @@ def compute_eigen_decomposition(X, center_data=True, return_covariance=False):
     else:
         return eigenvalues, eigenvectors
 
-# ------ Data generation helpers ------
-
-def generate_covariance_matrix(dim, eigenvalues, method="eigenvalues"):
-    # Create the diagonal matrix
-    D = np.diag(eigenvalues)
-    
-    # Generate random rotation Q
-    Q, _ = np.linalg.qr(np.random.randn(dim, dim))
-    
-    # Reconstruct full matrix
-    _Sigma = Q @ D @ Q.T
-    Sigma = 0.5 * (_Sigma + _Sigma.T)
-    
-    return Sigma  # Must return (dim, dim) array
-
-def generate_samples(d, number_of_samples):
-    mu = np.full(d, 0.0)
-    cov = generate_covariance_matrix(d, method='random')
-    samples = np.random.multivariate_normal(mu, cov, size=number_of_samples)
-    samples -= samples.mean(axis=0, keepdims=True)
-    return samples
 
 #---------- Traing and Testing helper ------------------
 def W_aligned_training_testing(model, X, batch_size=100):
@@ -720,7 +557,7 @@ def W_aligned_training_testing(model, X, batch_size=100):
         # cosine-monitor every {batch_size} steps (optional)
         if step % batch_size == 0:
             W = model.components_
-            PC = true_pcs_rows(X, model.m)
+            PC, _, _ = pca_topk(X, k=model.output_size)
             ordered_PCs , best_corrs, _ = best_match_alignment(W, PC)
             hist_best_corr.append(best_corrs)
             print(f"step {step:4d} | order = {ordered_PCs} | best|corr|={np.round(best_corrs,3)}")
@@ -730,7 +567,7 @@ def W_aligned_training_testing(model, X, batch_size=100):
                 f"neuron {i+1}": hist_best_corr[:, i] for i in ordered_PCs
             }
 
-    visualize_alignment(list(display_dict.values()), list(display_dict.keys()), model.m, "batch")
+    visualize_alignment(list(display_dict.values()), list(display_dict.keys()), model.output_size, "batch")
 
 
 def Y_aligned_training_testing(model, X, batch_size=1, alignment = "corr"):
@@ -741,7 +578,7 @@ def Y_aligned_training_testing(model, X, batch_size=1, alignment = "corr"):
     # post-training, re-compute outputs for all samples using the learned weights
     Y_output = model.transform(X)
     # get true PC scores
-    PC_scores = get_pc_scores(X, true_pcs_rows(X), m=model.m)
+    PC_scores, _, _ = pca_topk(X, k=model.output_size)
     order, similarity, _, _ = best_match_align_timeseries(Y_output, PC_scores, metric=alignment)
     # print(f"order = {order} | best|corr|= {np.round(similarity,3)}")
     return order, similarity
@@ -749,13 +586,14 @@ def Y_aligned_training_testing(model, X, batch_size=1, alignment = "corr"):
 
 
 # ---------- Online training testing ------------------
-def Y_aligned_training_testing_online(model, X, batch_size=1, alignment = "cov", graph=True):
+def Y_aligned_training_testing_online(model, X, batch_size=1, alignment = "eigenvectors", graph=True):
+    """
+    alignment can be "eigenvectors" or "timeseries"
+    """
     number_of_samples = X.shape[0]
     similarity_list = []
     # get true PC scores
-    PC_scores = get_pc_scores(X, true_pcs_rows(X), m=model.m)
-    # get the eigenvectors of the covariance matrix of the data
-    _, eigenvectors = compute_eigen_decomposition(X, center_data=True)
+    eigenvectors, _, PC_scores = pca_topk(X, k=model.output_size)
     # print(f'W: {model.W}; V: {model.V}')
     for step in range(0, number_of_samples, batch_size):
         X_train = X[step:step+batch_size]
@@ -766,8 +604,12 @@ def Y_aligned_training_testing_online(model, X, batch_size=1, alignment = "cov",
             V = model.V
         except AttributeError:
             V = None
-        order, similarity, _ = best_match_align_eigenvectors(model.W, V, eigenvectors[:,:model.m])
-        # order, similarity, _, _ = best_match_align_timeseries(Y_output, PC_scores[:,:model.m], metric=alignment)
+        if alignment == "eigenvectors":
+            order, similarity, _ = best_match_align_eigenvectors(model.W, V, eigenvectors[:,:model.output_size])
+        elif alignment == "timeseries":
+            order, similarity, _, _ = best_match_align_timeseries(Y_output, PC_scores[:,:model.output_size], metric=alignment)
+        else:
+            raise ValueError(f"alignment must be 'eigenvectors' or 'timeseries', got {alignment}")
         if step % 1000 == 0:
             print(f"step {step:4d} | order = {order} | best|corr|= {np.round(similarity,3)}")
         # based on the order, sort the similarity to match PC order
@@ -779,49 +621,14 @@ def Y_aligned_training_testing_online(model, X, batch_size=1, alignment = "cov",
         similarity_list.append(ordered_similarity)
     similarity_list = np.array(similarity_list)
     if graph:
-        visualize_alignment([similarity_list[:, i] for i in range(model.m)],
-                                    [f"Neuron {i+1}" for i in range(model.m)],
-                                    model.m, "trials")
+        visualize_alignment([similarity_list[:, i] for i in range(model.output_size)],
+                                    [f"Neuron {i+1}" for i in range(model.output_size)],
+                                    model.input_size, "trials")
     return order, similarity
 
 
-# ---------- Averaged training testing ------------------
-def averaged_training_testing_W(model, model_paras, X, runs = 10, batch_size=100, graph=True):
-    df_best_corr = pd.DataFrame(data=np.full((runs, model_paras['output_dim'] ), np.nan), 
-                                columns=[f"PC_{i+1}" for i in range(model_paras['output_dim'])],
-                                index=[f"run_{i+1}" for i in range(runs)])
-    number_of_samples = X.shape[0]
-    for run in range(runs):
-        _model = model(**model_paras)  # re-initialize model for each run if needed
-        for step in range(0, number_of_samples, batch_size):
-            X_train = X[step:step+batch_size]
-            _model.step(X_train)
-            W = _model.components_
-            PC = true_pcs_rows(X, _model.m)
-            ordered_PCs, best_corrs, _ = best_match_alignment(W, PC)
-        # based on the order_PCs, sort the best_corrs to match PC order
-        combined_lists = zip(ordered_PCs, best_corrs)
-        # Sort the pairs based on PC_orders
-        sorted_combined_lists = sorted(combined_lists)
-        # Unzip the sorted pairs
-        _, sorted_best_corrs = zip(*sorted_combined_lists)
-        df_best_corr.iloc[run, :] = sorted_best_corrs
-        print(f"run {run+1:2d} | order = {ordered_PCs} | best|corr|={np.round(best_corrs,3)}")
-    if graph:
-        # plot the bar graph with error bars of mean and std based on df_best_corr
-        means = df_best_corr.mean(axis=0)
-        stds = df_best_corr.std(axis=0)
-        plt.figure(figsize=(10, 6))
-        plt.bar(means.index, means.values, yerr=stds.values, capsize=5)
-        # plt.ylim(0, 1.1)
-        plt.ylabel('Mean Absolute Correlation')
-        plt.title('Mean Absolute Correlation with True PCs Across Runs')
-        plt.show()
-    return df_best_corr
+# ------ Data generation helpers ------
 
-
-
-# --- helpers (same as before) ---
 def eig_sorted(Sigma: np.ndarray):
     w, V = np.linalg.eigh(Sigma)
     idx = np.argsort(w)[::-1]
@@ -856,6 +663,28 @@ def _plot_eigenvectors(ax, Sigma, color, label_prefix, alpha=0.95):
 
 
 # 1. The Rotation Matrix Generator
+
+def generate_covariance_matrix(dim, eigenvalues, method="eigenvalues"):
+    # Create the diagonal matrix
+    D = np.diag(eigenvalues)
+    
+    # Generate random rotation Q
+    Q, _ = np.linalg.qr(np.random.randn(dim, dim))
+    
+    # Reconstruct full matrix
+    _Sigma = Q @ D @ Q.T
+    Sigma = 0.5 * (_Sigma + _Sigma.T)
+    
+    return Sigma  # Must return (dim, dim) array
+
+def generate_samples(d, number_of_samples):
+    mu = np.full(d, 0.0)
+    cov = generate_covariance_matrix(d, method='random')
+    samples = np.random.multivariate_normal(mu, cov, size=number_of_samples)
+    samples -= samples.mean(axis=0, keepdims=True)
+    return samples
+
+
 def rotation_matrix_nd(d: int, axis1: int, axis2: int, phi_rad: float) -> np.ndarray:
     R = np.eye(d)
     c, s = np.cos(phi_rad), np.sin(phi_rad)
@@ -866,50 +695,28 @@ def rotation_matrix_nd(d: int, axis1: int, axis2: int, phi_rad: float) -> np.nda
     return R
 
 
-def instantiate_rotated_data(N, m, Sigma_m, phi_rad=0, seed=0, n_samples=10001):
-    """
-    Generate N-dimensional data from m-dimensional covariance matrix.
-    The data will have only m effective PCs even though it's in N dimensions.
-    
-    Parameters:
-    -----------
-    N : int
-        Output dimension (number of neurons, e.g., 64)
-    m : int
-        Intrinsic dimension (number of PCs, e.g., 4)
-    eigenvalues : array-like, shape (m,)
-        Eigenvalues for the m×m covariance matrix
-    phi_rad : float
-        Rotation angle in radians (for generating X_after)
-    seed : int
-        Random seed
-    n_samples : int
-        Number of samples to generate
-        
-    Returns:
-    --------
-    X_before : ndarray, shape (n_samples, N)
-        Data in N dimensions with m effective PCs
-    X_after : ndarray, shape (n_samples, N)
-        Rotated data in N dimensions with m effective PCs
-    """
+def instantiate_samples_by_cov(Sigma, N, m, seed=0, n_samples=10001):
     rng = np.random.default_rng(seed)
-
-    # Step 2: Generate data in m-dimensional space
-    Z_before = rng.multivariate_normal(np.zeros(m), Sigma_m, size=n_samples)
+    _Z = rng.multivariate_normal(np.zeros(m), Sigma, size=n_samples)
+    if N > m:
+        Q, _ = np.linalg.qr(rng.standard_normal((N, m)))
+        A = Q[:, :m]  # (N, m) projection matrix
+        Z = _Z @ A.T
+    else:
+        Z = _Z
+    return Z
     
-    # Step 3: Rotate in m-dimensional space (for X_after)
-    R_m = rotation_matrix_nd(m, axis1=0, axis2=1, phi_rad=phi_rad)
-    Z_after = Z_before @ R_m.T
-    
-    # Step 4: Project from m dimensions to N dimensions
-    # Generate a random orthogonal projection matrix
-    # This ensures the data in N dimensions only has m effective PCs
-    Q, _ = np.linalg.qr(rng.standard_normal((N, m)))
-    A = Q[:, :m]  # (N, m) projection matrix
-    
-    # Project to N dimensions
-    X_before = Z_before @ A.T  # (n_samples, m) @ (m, N) = (n_samples, N)
-    X_after = Z_after @ A.T    # (n_samples, m) @ (m, N) = (n_samples, N)
-    
-    return X_before, X_after
+### A helper function to check and correct signs of the Y_output based on the order of the PCs
+def sign_check(Y_output, scores, order):
+    # Check and correct signs by comparing with PC scores
+    # For each aligned component, check if it correlates positively or negatively with the corresponding PC
+    m = Y_output.shape[1]
+    signs = np.ones(m)
+    for i in range(m):
+        pc_idx = order[i]  # Which PC this Y_output column is matched to
+        # Compute correlation between Y_output[:, i] and scores[:, pc_idx]
+        corr = np.corrcoef(Y_output[:, i], scores[:, pc_idx])[0, 1]
+        # If negative correlation, flip the sign
+        if corr < 0:
+            signs[i] = -1
+    return signs
