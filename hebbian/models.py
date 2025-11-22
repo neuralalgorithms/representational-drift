@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from typing import Optional, Any
 import os
 
-### --------- Single-layer Hebbian models --------- ###
+### ---------   Hebbian models without lateral connections --------- ###
 class HebbianModel(ABC):
     """
     Base class for linear Hebbian models.
@@ -277,9 +277,9 @@ class LeenMinimalPCA:
 
     def _forward(self, X: np.ndarray) -> np.ndarray:
         """
-        X: (B, input_size) -> Y: (B, output_size)
+        X: (T, input_size) -> Y: (T, output_size)
         """
-        Y = X @ self.W.T  # (B, output_size) = W x
+        Y = X @ self.W.T  # (T, output_size) = W x
         return Y
 
     def _symmetrize_q(self):
@@ -302,16 +302,16 @@ class LeenMinimalPCA:
 
     def step(self, X: np.ndarray):
         """
-        One learning step on a batch X: shape (B, d).
+        One learning step on a batch X: shape (T, d).
         """
         X = np.asarray(X, dtype=float)
-        B = X.shape[0]
+        T = X.shape[0]
 
         # Forward pass
-        Y = self._forward(X)                                     # (B, m)
+        Y = self._forward(X)                                     # (T, m)
 
         # Batch moments
-        y_cov = (Y.T @ Y) / B                                    # (output_size, output_size)  ~ < y_i y_j >
+        y_cov = (Y.T @ Y) / T                                    # (output_size, output_size)  ~ < y_i y_j >
         y_var = np.diag(y_cov).copy()                            # (output_size,)
 
         # EMA update of activities λ_i ~ E[y_i^2]
@@ -329,9 +329,9 @@ class LeenMinimalPCA:
         self._clip_q_spectral_norm()
         # ----- Forward update (Hebb-Oja, gated by q) -----
         # s = (I + q) y  (per sample); with row-vectors: S = Y @ (I+q)^T
-        S = Y @ (np.eye(self.output_size) + self.q).T                      # (B, output_size)
+        S = Y @ (np.eye(self.output_size) + self.q).T                      # (T, output_size)
         # < x * s_i > as a matrix: (d, m) then transpose to (m, d)
-        XS = (X.T @ S) / B                                       # (input_size, output_size)
+        XS = (X.T @ S) / T                                       # (input_size, output_size)
         dW = self.eta_w * (XS.T - y_var[:, None] * self.W)       # (output_size, input_size)
         self.W += dW
 
@@ -363,7 +363,7 @@ class LeenMinimalPCA:
 
 
 
-### --------- Multi-layer Hebbian models --------- ###
+### --------- Hebbian models with lateral connections --------- ###
 
 class LeenCompletePCA:
     """
