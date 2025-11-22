@@ -720,3 +720,62 @@ def sign_check(Y_output, scores, order):
         if corr < 0:
             signs[i] = -1
     return signs
+
+
+### Rotation matrix helpers
+def bar_graph_with_error_bars(df_best_corr, title):
+    figure = plt.figure()
+    means = df_best_corr.mean(axis=0)
+    stds = df_best_corr.std(axis=0)
+    plt.figure(figsize=(10, 6))
+    plt.bar(means.index, means.values, yerr=stds.values, capsize=5)
+    plt.ylabel('Mean Absolute Correlation')
+    plt.title(title)
+    plt.show()
+
+def two_phase_training_testing(model, data_before, data_after, m, model_paras_after=None, runs =10, graph = True, alignment = "eigenvectors"):
+    df_best_corr_after = pd.DataFrame(data=np.full((runs, m), np.nan), 
+                            columns=[f"PC_{i+1}" for i in range(m)],
+                            index=[f"run_{i+1}" for i in range(runs)])
+    df_best_corr_before = pd.DataFrame(data=np.full((runs, m), np.nan), 
+                            columns=[f"PC_{i+1}" for i in range(m)],
+                            index=[f"run_{i+1}" for i in range(runs)])
+
+    for run in range(runs):
+        print(f"run {run+1:2d}")
+        print(f"X_before")
+        order, similarity = Y_aligned_training_testing_online(model, X=data_before, graph=True, alignment=alignment)
+        # print(f"After first phase: model.W = {model.W}, model.V: {model.V}")
+
+        # print(f"Y_output_after_first_phase: {model.transform(data_before)}")
+       # based on the order, sort the similarity to match PC order
+        combined_lists = zip(order, similarity)
+        # Sort the pairs based on PC_orders
+        sorted_combined_lists = sorted(combined_lists)
+        # Unzip the sorted pairs
+        _, ordered_similarity = zip(*sorted_combined_lists)
+        df_best_corr_before.iloc[run, :] = ordered_similarity 
+
+#################################################################
+        print(f"X_after")
+        # update the model parameters, if provided
+        if model_paras_after is not None:
+            for key, value in model_paras_after.items():
+                if hasattr(model, key):
+                    setattr(model, key, value)
+
+        order, similarity = Y_aligned_training_testing_online(model, X=data_after, graph=True, alignment=alignment)
+
+        # based on the order, sort the similarity to match PC order
+        combined_lists = zip(order, similarity)
+        # Sort the pairs based on PC_orders
+        sorted_combined_lists = sorted(combined_lists)
+        # Unzip the sorted pairs
+        _, ordered_similarity = zip(*sorted_combined_lists)
+        df_best_corr_after.iloc[run, :] = ordered_similarity
+        # print(f"run {run+1:2d} | order = {order} | best|corr|= {np.round(similarity,3)}")
+        model.reset()
+
+    if graph == True:
+        bar_graph_with_error_bars(df_best_corr_before, "Mean Absolute Correlation (before)")
+        bar_graph_with_error_bars(df_best_corr_after, "Mean Absolute Correlation (after)")
