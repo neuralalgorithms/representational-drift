@@ -219,48 +219,48 @@ class LeenMinimalPCA:
     """
     Activity-dependent Leen/Földiak PCA learner (NumPy).
 
-    y = (I - q)^{-1} W x        # complete mode
+    y = (I - V)^{-1} W x        # complete mode
     or y = W x                  # minimal mode (fast, robust for learning)
 
     Lateral (off-diagonal only):
-        q_{ij} <- q_{ij} + η_q * (λ_i + λ_j) * ( - q_{ij} - C * <y_i y_j> )
+        V_{ij} <- V_{ij} + η_v * (λ_i + λ_j) * ( - V_{ij} - C * <y_i y_j> )
 
     Forward (per unit i):
         w_i <- w_i + η_W * ( < x * s_i > - < y_i^2 > w_i )
-        where s = y + q y  (vector per sample); i.e. s = (I + q) y
+        where s = y + V y  (vector per sample); i.e. s = (I + V) y
 
     Parameters
     ----------
     input_dim : int
     output_dim : int
     eta_w : float            # forward learning rate
-    eta_q : float            # lateral learning rate (make this larger than eta_w)
+    eta_v : float            # lateral learning rate (make this larger than eta_w)
     C : float                # coupling; pick > 1 (e.g., 1.5)
     ema_alpha : float        # EMA step for activity λ_i ≈ E[y_i^2]
     forward_mode : str       # "minimal", "complete", or "complete_first_order"
-    symmetrize_q : bool      # keep q explicitly symmetric + zero diagonal after each step
-    clip_q_spectral : float or None  # if not None, shrink q to keep ||q||_2 <= this value (e.g., 0.95)
+    symmetrize_V : bool      # keep V explicitly symmetric + zero diagonal after each step
+    clip_V_spectral : float or None  # if not None, shrink V to keep ||V||_2 <= this value (e.g., 0.95)
     seed : int or None
     """
     def __init__(self,
                  input_size: int,
                  output_size: int,
                  eta_w: float = 1e-3,
-                 eta_q: float = 1e-2,
+                 eta_v: float = 1e-2,
                  C: float = 1.5,
                  ema_alpha: float = 0.05,
-                 symmetrize_q: bool = True,
+                 symmetrize_V: bool = True,
                  seed: int | None = 0, 
-                 clip_q_spectral: float = 0.95):
+                 clip_V_spectral: float = 0.95):
 
         self.input_size = input_size
         self.output_size = output_size
         self.eta_w = eta_w
-        self.eta_q = eta_q
+        self.eta_v = eta_v
         self.C = C
         self.ema_alpha = ema_alpha
-        self.symmetrize_q = symmetrize_q
-        self.clip_q_spectral = clip_q_spectral
+        self.symmetrize_V = symmetrize_V
+        self.clip_V_spectral = clip_V_spectral
 
         self.rng = np.random.default_rng(seed)
         # Row-wise unit-norm init for W
@@ -268,8 +268,8 @@ class LeenMinimalPCA:
         W /= np.linalg.norm(W, axis=1, keepdims=True) + 1e-12
         self.W = W
         # Symmetric zero-diagonal init for q
-        self.q = np.zeros((self.output_size, self.output_size))
-        np.fill_diagonal(self.q, 0.0)
+        self.V = np.zeros((self.output_size, self.output_size))
+        np.fill_diagonal(self.V, 0.0)
         # EMA of activities (start small positive to avoid zero)
         self.lam = np.full(self.output_size, 1e-6)
 
@@ -282,20 +282,20 @@ class LeenMinimalPCA:
         Y = X @ self.W.T  # (T, output_size) = W x
         return Y
 
-    def _symmetrize_q(self):
-        self.q = 0.5 * (self.q + self.q.T)
-        np.fill_diagonal(self.q, 0.0)
+    def _symmetrize_V(self):
+        self.V = 0.5 * (self.V + self.V.T)
+        np.fill_diagonal(self.V, 0.0)
 
-    def _clip_q_spectral_norm(self):
-        if self.clip_q_spectral is None:
+    def _clip_V_spectral_norm(self):
+        if self.clip_V_spectral is None:
             return
         # Spectral norm via SVD
-        u, s, vt = np.linalg.svd(self.q, full_matrices=False)
+        u, s, vt = np.linalg.svd(self.V, full_matrices=False)
         smax = s[0]
-        if smax > self.clip_q_spectral:
-            s = s * (self.clip_q_spectral / (smax + 1e-12))
-            self.q = (u * s) @ vt
-            self._symmetrize_q()    
+        if smax > self.clip_v_spectral:
+            s = s * (self.clip_V_spectral / (smax + 1e-12))
+            self.V = (u * s) @ vt
+            self._symmetrize_V()    
 
 
     # ---------- public API ----------
@@ -320,16 +320,16 @@ class LeenMinimalPCA:
         # ----- Lateral update (off-diagonal) -----
         lam_sum = self.lam[:, None] + self.lam[None, :]          # (output_size, output_size)  (λ_i + λ_j)
         # dq = self.eta_q * lam_sum * ( - self.q - self.C * y_cov )  # 09222025: This is wrong. Fixed below:
-        dq = self.eta_q * (- lam_sum * self.q  - self.C * y_cov)             # decay term
-        np.fill_diagonal(dq, 0.0)
-        self.q += dq
+        dV = self.eta_v * (- lam_sum * self.V  - self.C * y_cov)             # decay term
+        np.fill_diagonal(dV, 0.0)
+        self.V += dV
 
-        if self.symmetrize_q:
-            self._symmetrize_q()
-        self._clip_q_spectral_norm()
+        if self.symmetrize_V:
+            self._symmetrize_V()
+        self._clip_V_spectral_norm()
         # ----- Forward update (Hebb-Oja, gated by q) -----
-        # s = (I + q) y  (per sample); with row-vectors: S = Y @ (I+q)^T
-        S = Y @ (np.eye(self.output_size) + self.q).T                      # (T, output_size)
+        # s = (I + V) y  (per sample); with row-vectors: S = Y @ (I+V)^T
+        S = Y @ (np.eye(self.output_size) + self.V).T                      # (T, output_size)
         # < x * s_i > as a matrix: (d, m) then transpose to (m, d)
         XS = (X.T @ S) / T                                       # (input_size, output_size)
         dW = self.eta_w * (XS.T - y_var[:, None] * self.W)       # (output_size, input_size)
@@ -350,8 +350,9 @@ class LeenMinimalPCA:
         """
         self.W = self.rng.normal(size=(self.output_size, self.input_size))
         self.W /= np.linalg.norm(self.W, axis=1, keepdims=True) + 1e-12
-        self.q = np.zeros((self.output_size, self.output_size))
-        np.fill_diagonal(self.q, 0.0)
+        self.V = np.zeros((self.output_size, self.output_size))
+        np.fill_diagonal(self.V, 0.0)
+        # self.V = self.rng.normal(size=(self.output_size, self.output_size))
         self.lam = np.full(self.output_size, 1e-6)
 
     @property
@@ -424,7 +425,8 @@ class LeenCompletePCA:
         self.W = W
         self.initial_W = W.copy()
         # Symmetric zero-diagonal init for V
-        self.V = np.zeros((self.output_size, self.output_size))
+        # self.V = np.zeros((self.output_size, self.output_size))
+        self.V = self.rng.normal(size=(self.output_size, self.output_size))
         # EMA of activities (start small positive to avoid zero)
         self.lam = np.full(self.output_size, 1e-6)
         # initialize the y_0. with shape (batch_size, m)
@@ -438,7 +440,8 @@ class LeenCompletePCA:
         self.initial_W = W.copy()
 
         # Reinitialize lateral q and EMA lam exactly as in __init__
-        self.V = np.zeros((self.output_size, self.output_size))
+        # self.V = np.zeros((self.output_size, self.output_size))
+        self.V = self.rng.normal(size=(self.output_size, self.output_size))
         self.lam = np.full(self.output_size, 1e-6)
 
     # ---------- modified forward function to Y = Wx + Qy ----------
@@ -600,7 +603,8 @@ class OneShotLeenCompletePCA:
         self.initial_W = W.copy()
 
         # Symmetric zero-diagonal V
-        self.V = np.zeros((self.output_size, self.output_size))
+        # self.V = np.zeros((self.output_size, self.output_size))
+        self.V = self.rng.normal(size=(self.output_size, self.output_size))
         # EMA of activities λ_i ≈ E[y_i^2]
         self.lam = np.full(self.output_size, 1e-6)
 
@@ -616,7 +620,8 @@ class OneShotLeenCompletePCA:
         self.W = W
         self.initial_W = W.copy()
 
-        self.V = np.zeros((self.output_size, self.output_size))
+        # self.V = np.zeros((self.output_size, self.output_size))
+        self.V = self.rng.normal(size=(self.output_size, self.output_size))
         self.lam = np.full(self.output_size, 1e-6)
 
     def _forward(self, X: np.ndarray) -> np.ndarray:
@@ -679,6 +684,9 @@ class OneShotLeenCompletePCA:
         lam_sum = self.lam[:, None] + self.lam[None, :]  # (output_size, output_size)
         # ΔV_ij = η_v * ( (λ_i + λ_j) * V_ij - C * <y_i y_j> )
         dV = self.eta_v * (lam_sum * self.V - self.C * y_cov)
+
+        ### 11222025: This is to TEST the lateral inhibition of the model. 
+        # dV = np.minimum(dV, 0.0)
         np.fill_diagonal(dV, 0.0)
         self.V += dV
 
@@ -787,7 +795,8 @@ class OneShotLeenFreislebenPCA:
         self.initial_W = W.copy()
 
         # Symmetric zero-diagonal V
-        self.V = np.zeros((self.output_size, self.output_size), dtype=float)
+        # self.V = np.zeros((self.output_size, self.output_size), dtype=float)
+        self.V = self.rng.normal(size=(self.output_size, self.output_size))
 
     # ---------- helpers ----------
 
@@ -800,7 +809,8 @@ class OneShotLeenFreislebenPCA:
         self.W = W
         self.initial_W = W.copy()
 
-        self.V = np.zeros((self.output_size, self.output_size), dtype=float)
+        # self.V = np.zeros((self.output_size, self.output_size), dtype=float)
+        self.V = self.rng.normal(size=(self.output_size, self.output_size))
 
     def _forward(self, X: np.ndarray) -> np.ndarray:
         """
@@ -943,7 +953,8 @@ class LeenCompletePCA_TD:
         self.W = W
         self.initial_W = W.copy()
         # Symmetric zero-diagonal init for V
-        self.V = np.zeros((self.output_size, self.output_size))
+        # self.V = np.zeros((self.output_size, self.output_size))
+        self.V = self.rng.normal(size=(self.output_size, self.output_size))
         # EMA of activities (start small positive to avoid zero)
         self.lam = np.full(self.output_size, 1e-6)
         # initialize the y_0. with shape (batch_size, m)
@@ -957,7 +968,8 @@ class LeenCompletePCA_TD:
         self.initial_W = W.copy()
 
         # Reinitialize lateral q and EMA lam exactly as in __init__
-        self.V = np.zeros((self.output_size, self.output_size))
+        # self.V = np.zeros((self.output_size, self.output_size))
+        self.V = self.rng.normal(size=(self.output_size, self.output_size))
         self.lam = np.full(self.output_size, 1e-6)
 
     # ---------- modified forward function to Y_{t+1} = Wx + y_{t} V^T ----------
@@ -1089,7 +1101,8 @@ class FoldiakPCA:
         self.initial_W = W.copy()
 
         # Symmetric zero-diagonal V
-        self.V = np.zeros((self.output_size, self.output_size), dtype=float)
+        # self.V = np.zeros((self.output_size, self.output_size), dtype=float)
+        self.V = self.rng.normal(size=(self.output_size, self.output_size))
 
     # ---------- helpers ----------
 
@@ -1102,7 +1115,8 @@ class FoldiakPCA:
         self.W = W
         self.initial_W = W.copy()
 
-        self.V = np.zeros((self.output_size, self.output_size), dtype=float)
+        # self.V = np.zeros((self.output_size, self.output_size), dtype=float)
+        self.V = self.rng.normal(size=(self.output_size, self.output_size))
 
     def _forward(self, X: np.ndarray) -> np.ndarray:
         """
