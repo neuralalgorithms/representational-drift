@@ -683,6 +683,9 @@ class OneShotLeenCompletePCA:
         # ----- Lateral update: activity-dependent anti-Hebbian -----
         lam_sum = self.lam[:, None] + self.lam[None, :]  # (output_size, output_size)
         # ΔV_ij = η_v * ( (λ_i + λ_j) * V_ij - C * <y_i y_j> )
+
+
+        # dV = self.eta_v * (lam_sum * self.V - self.C * y_cov) 
         dV = self.eta_v * (lam_sum * self.V - self.C * y_cov)
 
         ### 11222025: This is to TEST the lateral inhibition of the model. 
